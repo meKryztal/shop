@@ -64,14 +64,40 @@ local pim = component.pim
 
 -- Русские названия предметов: словарь "<id>&&<damage>" -> название (см. build_ru_from_nei.py).
 -- Файл необязателен: без него названия остаются такими, как их отдаёт ME.
-local RU = {}
+-- Словари делает nei_to_lua.py: ru_names.lua (предметы) и ru_extra.lua (виды, чары/зелья, обработчики).
+-- Грузятся лениво и под pcall: нет файла или не хватило памяти - возвращается запасной текст.
+local ru = {}
 do
-  local okRu, t = pcall(dofile, "/home/kitshop/ru_names.lua")
-  if okRu and type(t) == "table" then RU = t end
+  local DIR = "/home/kitshop"
+  local items, extra
+
+  local function load(file)
+    local ok, t = pcall(dofile, DIR .. "/" .. file)
+    if ok and type(t) == "table" then return t end
+    return {}
+  end
+  local function getItems()
+    if not items then items = load("ru_names.lua") end
+    return items
+  end
+  local function getExtra()
+    if not extra then
+      extra = load("ru_extra.lua")
+      extra.species, extra.keys, extra.handlers =
+        extra.species or {}, extra.keys or {}, extra.handlers or {}
+    end
+    return extra
+  end
+
+  function ru.item(name, dmg, fb)
+    return getItems()[tostring(name) .. "&&" .. math.floor(tonumber(dmg) or 0)] or fb
+  end
+  function ru.species(uid, fb) return getExtra().species[tostring(uid)] or fb end
+  function ru.key(k, fb)       return getExtra().keys[tostring(k)] or fb end
+  function ru.handler(c, fb)   return getExtra().handlers[tostring(c)] or fb end
+  function ru.unload() items, extra = nil, nil; collectgarbage() end
 end
-local function ruName(name, dmg, fallback)
-  return RU[tostring(name) .. "&&" .. math.floor(tonumber(dmg) or 0)] or fallback
-end
+local function ruName(name, dmg, fallback) return ru.item(name, dmg, fallback) end
 
 ----------------------------------------------------------------------
 -- УТИЛИТЫ
