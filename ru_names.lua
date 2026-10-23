@@ -1362,6 +1362,7 @@ return {
   ["OpenComputers:hologram2&&0"] = "Голографический проектор (2-ой уровень)",
   ["OpenComputers:hoverBoots&&0"] = "Парящие ботинки",
   ["OpenComputers:item&&0"] = "Анализатор",
+  ["OpenComputers:item&&112"] = "МФУ",
   ["OpenComputers:keyboard&&0"] = "Клавиатура",
   ["OpenComputers:microcontroller&&0"] = "Микроконтроллер",
   ["OpenComputers:motionSensor&&0"] = "Датчик движения",
