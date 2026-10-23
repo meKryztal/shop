@@ -387,7 +387,6 @@ end
 -- fname/fdmg - необязательный фильтр по одному предмету.
 local detailCache = {}
 local function meList(fname, fdmg)
-  collectgarbage()
   local ok, base
   if fname then ok, base = pcall(me.getItemsInNetwork, { name = fname, damage = fdmg })
   else ok, base = pcall(me.getItemsInNetwork) end
