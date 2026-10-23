@@ -1019,10 +1019,14 @@ local function meFingerprint(name, dmg, var)
   return nil, "бак не найден в ME (var=" .. var:sub(1, 12) .. ")"
 end
 
-local function doClaim(pu, it)
+local function doClaim(pu, it, quiet)
+  -- quiet: массовая выдача, итог показывает claimAll; возвращает "ok" | "space" | "me" | "fail"
+  local function out(msg, ok)
+    if quiet then S.msg = msg; S.msgOk = (ok ~= false) else flash(msg, ok) end
+  end
   -- в сообщениях хеш не показываем
   local shown = tostring(it.label):gsub("%s*#[%w_%-]+", ""):gsub("%s*%(%s*%)", "")
-  if it.qty <= 0 then return end
+  if it.qty <= 0 then return "ok" end
   local key = itemKey(it.name, it.damage, it.var)
   local maxSize = (cache.byKey[key] and cache.byKey[key].maxSize) or 64
 
@@ -1030,17 +1034,20 @@ local function doClaim(pu, it)
   local slots = readSlots()
   local space = spaceIn(slots, it.name, it.damage, maxSize, it.var)
   if space <= 0 then
-    return flash("Нет места в инвентаре. Освободите слот и нажмите «Забрать» ещё раз.", false)
+    out("Нет места в инвентаре. Освободите слот и нажмите «Забрать» ещё раз.", false)
+    return "space"
   end
   local real = meCount(it.name, it.damage, it.var)
-  if real == nil then return flash("ME-сеть недоступна. Попробуйте позже.", false) end
+  if real == nil then out("ME-сеть недоступна. Попробуйте позже.", false); return "me" end
   if real <= 0 then
-    return flash("Ресурса сейчас нет в ME. Напишите владельцу через «Обратная связь».", false)
+    out("Ресурса сейчас нет в ME. Напишите владельцу через «Обратная связь».", false)
+    return "me"
   end
 
   local fp, fpErr = meFingerprint(it.name, it.damage, it.var)
-  if not fp then return flash("Не могу выдать «" .. shown .. "»: " .. tostring(fpErr), false) end
+  if not fp then out("Не могу выдать «" .. shown .. "»: " .. tostring(fpErr), false); return "fail" end
   local deliver = math.min(it.qty, space, real)
+  local bySpace = space < it.qty and space <= real
   local before = countIn(slots, it.name, it.damage, it.var)
 
   -- сначала списываем в базе (чтобы при сбое питания выдача не удвоилась)
@@ -1069,12 +1076,34 @@ local function doClaim(pu, it)
   if given == 0 then
     local extra = ""
     if S.player.owner and lastExportErr then extra = " [" .. lastExportErr:sub(1, 80) .. "]" end
-    return flash("Не удалось выдать «" .. shown .. "». Попробуйте ещё раз." .. extra, false)
+    out("Не удалось выдать «" .. shown .. "». Попробуйте ещё раз." .. extra, false)
+    return "fail"
   elseif it.qty > 0 then
-    return flash("Выдано " .. given .. " из " .. (given + it.qty) .. " («" .. shown ..
-                 "»). Освободите место и нажмите «Забрать» снова.", true)
+    out("Выдано " .. given .. " из " .. (given + it.qty) .. " («" .. shown ..
+        "»). Освободите место и нажмите «Забрать» снова.", true)
+    return bySpace and "space" or "me"
   end
-  flash("Выдано: " .. shown .. " x" .. given, true)
+  out("Выдано: " .. shown .. " x" .. given, true)
+  return "ok"
+end
+
+-- «Забрать всё»: выдаём ресурсы по очереди, пока есть место в инвентаре
+local function claimAll(pu)
+  local total, noMe, stopSpace = 0, 0, false
+  status("Выдаю всё по очереди...")
+  for _, it in ipairs(pu.items) do
+    if it.qty > 0 then
+      local before = it.qty
+      local r = doClaim(pu, it, true)
+      total = total + (before - it.qty)
+      if r == "space" then stopSpace = true; break end
+      if it.qty > 0 and (r == "me" or r == "fail") then noMe = noMe + 1 end
+    end
+  end
+  local msg = "Выдано предметов: " .. total .. "."
+  if stopSpace then msg = msg .. " Нет места в инвентаре: освободите слоты и нажмите «Забрать всё» снова."
+  elseif noMe > 0 then msg = msg .. " Не удалось выдать позиций: " .. noMe .. " (нет в ME или ошибка)." end
+  flash(msg, total > 0 or not (stopSpace or noMe > 0))
 end
 
 -- Пополнение: pim.pushItem толкает предмет из слота игрока в соседний инвентарь (ME Interface).
@@ -1444,8 +1473,10 @@ end
 local function screenPurchase(p)
   local pu = findPurchase(p, S.purchaseId)
   if not pu then S.view = "mine"; return false end
-  text(2, 6, pad("Покупка #" .. pu.id .. ": " .. pu.kit, W - 2), C.accent, C.bg)
-  text(2, 8, "Забирайте ресурсы по одному. Нужно свободное место в инвентаре.", C.dim, C.bg)
+  text(2, 6, pad("Покупка #" .. pu.id .. ": " .. pu.kit, W - 36), C.accent, C.bg)
+  text(2, 8, pad("Забирайте по одному или кнопкой «Забрать всё».", W - 36), C.dim, C.bg)
+  addBtn(W - 33, 6, 30, 3, "Забрать всё", { disabled = purchasePending(pu) == 0, bg = C.tabOn,
+    fn = function() claimAll(pu) end })
   local first, last = paged(#pu.items, LIST_Y)
   for i = first, last do
     local it = pu.items[i]
