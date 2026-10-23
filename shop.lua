@@ -938,17 +938,23 @@ local function variantByHash(name, damage, hash, entry)
   return v
 end
 
+-- getAvailableItems в разных сборках возвращает таблицу только в некоторых режимах: пробуем все
+local function getAvail()
+  for _, mode in ipairs({ "ALL", "PROXY", "NONE", false }) do
+    local ok, r
+    if mode then ok, r = pcall(me.getAvailableItems, mode) else ok, r = pcall(me.getAvailableItems) end
+    if ok and type(r) == "table" then return r, mode end
+  end
+end
+
 -- NBT-хеш конкретного варианта. getItemsInNetwork хеш не отдаёт, поэтому перебираем
 -- getAvailableItems("ALL") и для каждой записи узнаём жидкость по хешу. Результат кэшируем.
 local hashCache = {}
 local function findNbtHash(name, damage, var)
   local ck = itemKey(name, damage, var)
   if hashCache[ck] then return hashCache[ck] end
-  local ok, list = pcall(me.getAvailableItems, "ALL")
-  if not ok or type(list) ~= "table" then
-    ok, list = pcall(me.getAvailableItems)
-  end
-  if not ok or type(list) ~= "table" then return nil end
+  local list = getAvail()
+  if not list then return nil end
   local found
   for _, e in pairs(list) do
     if type(e) == "table" then
@@ -2153,8 +2159,17 @@ local function avail_dump(v, ind, depth)
 end
 local function availCli()
   local f = lower(ARGS[2] or "tank")
-  local ok, list = pcall(me.getAvailableItems, "ALL")
-  if not ok then print("ошибка: " .. tostring(list)); return end
+  for _, mode in ipairs({ "ALL", "PROXY", "NONE" }) do
+    local ok, r = pcall(me.getAvailableItems, mode)
+    print("getAvailableItems(" .. mode .. "): ok=" .. tostring(ok) .. " тип=" .. type(r) ..
+          (type(r) ~= "table" and (" значение=" .. tostring(r):sub(1, 200)) or ""))
+  end
+  local ok0, r0 = pcall(me.getAvailableItems)
+  print("getAvailableItems(): ok=" .. tostring(ok0) .. " тип=" .. type(r0))
+
+  local list, mode = getAvail()
+  if not list then print("Ни один вариант не вернул таблицу."); return end
+  print("Использую режим: " .. tostring(mode))
   local shown = 0
   for _, e in pairs(list) do
     local line = avail_dump(e, "", 0)
@@ -2172,7 +2187,7 @@ local function availCli()
       if shown >= 4 then break end
     end
   end
-  if shown == 0 then print("Ничего не найдено (всего записей: " .. tostring(#list) .. ")") end
+  if shown == 0 then print("Ничего не найдено") end
 end
 
 if ARGS[1] == "owner" then ownerCli()
