@@ -305,21 +305,36 @@ local function scanME()
   end)
 end
 
--- Список для выбора предметов (владелец). Хранит только совпавшие с поиском
--- и не больше PICK_MAX штук - на огромной ME это не съедает память.
+-- нормализация для поиска: нижний регистр, разделители -> пробелы
+local function searchNorm(s)
+  return (lower(s):gsub("[_:%-%.]", " "))
+end
+
+-- Список для выбора предметов (владелец): ВСЕ предметы ME, отсортированные по алфавиту.
+-- Поиск: каждое слово запроса должно встречаться в названии или id предмета.
 local function pickerScan(filter)
   cache.items = {}
   return pcall(function()
     local list = me.getItemsInNetwork()
     if type(list) ~= "table" then error("ME вернула " .. type(list)) end
-    local f = lower(filter or "")
+
+    local words = {}
+    for w in searchNorm(filter or ""):gmatch("%S+") do words[#words + 1] = w end
+
     local out, seen = {}, {}
-    for _, it in ipairs(list) do
+    for _, it in pairs(list) do
       local name = type(it) == "table" and it.name
       if name then
         local var = variantOf(it)
         local label = labelOf(it, var)
-        if f == "" or lower(label .. " " .. name):find(f, 1, true) then
+        local match = true
+        if #words > 0 then
+          local hay = searchNorm(label .. " " .. name)
+          for _, w in ipairs(words) do
+            if not hay:find(w, 1, true) then match = false; break end
+          end
+        end
+        if match then
           local dmg = math.floor(tonumber(it.damage) or 0)
           local k = itemKey(name, dmg, var)
           local e = seen[k]
@@ -333,18 +348,15 @@ local function pickerScan(filter)
         end
       end
     end
-    local total = #out
-    for i = #out, CONFIG.PICK_MAX + 1, -1 do out[i] = nil end
     list = nil
     table.sort(out, function(a, b)
       if a[3] ~= b[3] then return a[3] < b[3] end
       if a[1] ~= b[1] then return a[1] < b[1] end
       return a[2] < b[2]
     end)
-    cache.items, cache.pickTotal, cache.pickMore = out, total, total > #out
+    cache.items, cache.pickTotal, cache.pickMore = out, #out, false
   end)
 end
-
 -- точный запрос по одному предмету (дёшево, используется при покупке/выдаче)
 local function meCount(name, damage, var)
   local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
