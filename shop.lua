@@ -378,11 +378,60 @@ local function migrateVariants(by)
   if changed then saveDB() end
 end
 
+-- Список предметов ME с NBT-хешем.
+-- Обычные предметы берём из getItemsInNetwork (там есть название), а предметы с NBT (hasTag),
+-- например баки с жидкостью, - из getAvailableItems: там у fingerprint есть nbt_hash.
+-- Жидкость и название NBT-предмета читаем из getItemDetail (кэш по хешу).
+-- fname/fdmg - необязательный фильтр по одному предмету.
+local detailCache = {}
+local function meList(fname, fdmg)
+  local ok, base
+  if fname then ok, base = pcall(me.getItemsInNetwork, { name = fname, damage = fdmg })
+  else ok, base = pcall(me.getItemsInNetwork) end
+  if not ok then return tostring(base) end
+  if type(base) ~= "table" then return base end
+  if type(me.getAvailableItems) ~= "function" then return base end
+  local ok2, raw = pcall(me.getAvailableItems)
+  if not ok2 or type(raw) ~= "table" then return base end
+
+  local out, tagged = {}, 0
+  for _, it in ipairs(base) do
+    if type(it) == "table" and not it.hasTag then out[#out + 1] = it end
+  end
+  for _, e in ipairs(raw) do
+    local f = type(e) == "table" and e.fingerprint
+    if type(f) == "table" and f.id and f.nbt_hash
+       and (not fname or (f.id == fname and math.floor(tonumber(f.dmg) or 0) == fdmg)) then
+      local it = { name = f.id, damage = f.dmg, size = tonumber(e.qty or e.size) or 0,
+                   nbt_hash = f.nbt_hash, label = f.id, maxSize = 64 }
+      local d = detailCache[f.nbt_hash]
+      if d == nil then
+        local ok3, det = pcall(me.getItemDetail, f)
+        if ok3 and type(det) == "table" and type(det.all) == "function" then
+          local ok4, all = pcall(det.all); if ok4 then det = all end
+        end
+        d = (ok3 and type(det) == "table") and det or false
+        detailCache[f.nbt_hash] = d
+      end
+      if d then
+        it.label = d.display_name or d.label or it.label
+        it.fluid_container = d.fluid_container
+        it.maxSize = tonumber(d.max_size or d.maxSize) or 64
+      end
+      out[#out + 1] = it
+      tagged = tagged + 1
+    end
+  end
+  -- если NBT-предметы через getAvailableItems не нашлись, лучше вернуть всё как есть
+  if tagged == 0 then return base end
+  return out
+end
+
 -- Лёгкий скан при входе: запоминаем остатки только нужных предметов.
 local function scanME()
   return pcall(function()
-    local list = me.getItemsInNetwork()
-    if type(list) ~= "table" then error("ME вернула " .. type(list)) end
+    local list = meList()
+    if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
     local want, by = wantedNames(), {}
     for _, it in ipairs(list) do
       local name = type(it) == "table" and it.name
@@ -415,8 +464,8 @@ end
 local function pickerScan(filter)
   cache.items = {}
   return pcall(function()
-    local list = me.getItemsInNetwork()
-    if type(list) ~= "table" then error("ME вернула " .. type(list)) end
+    local list = meList()
+    if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
 
     local words = {}
     for w in searchNorm(filter or ""):gmatch("%S+") do words[#words + 1] = w end
@@ -459,8 +508,8 @@ local function pickerScan(filter)
 end
 -- точный запрос по одному предмету (дёшево, используется при покупке/выдаче)
 local function meCount(name, damage, var)
-  local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
-  if not ok or type(list) ~= "table" then return nil end
+  local list = meList(name, damage)
+  if type(list) ~= "table" then return nil end
   local total = 0
   for _, it in ipairs(list) do
     if it.name == name and math.floor(tonumber(it.damage) or 0) == damage
@@ -475,8 +524,8 @@ end
 -- один и тот же предмет по-разному: жидкость / хеш). Возвращает вариант ME и остаток, либо nil.
 local function meResolve(name, damage, var)
   var = var or ""
-  local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
-  if not ok or type(list) ~= "table" then return nil end
+  local list = meList(name, damage)
+  if type(list) ~= "table" then return nil end
   local sizes, order = {}, {}
   for _, it in ipairs(list) do
     if it.name == name and math.floor(tonumber(it.damage) or 0) == damage then
