@@ -1058,7 +1058,9 @@ local function doClaim(pu, it)
     return flash("Выдано " .. given .. " из " .. (given + it.qty) .. " («" .. it.label ..
                  "»). Освободите место и нажмите «Забрать» снова.", true)
   end
-  flash("Выдано: " .. it.label .. " x" .. given, true)
+  local dbg = ""
+  if S.player.owner then dbg = "  [var=" .. tostring(it.var) .. ", hash=" .. tostring(fp.nbt_hash) .. "]" end
+  flash("Выдано: " .. it.label .. " x" .. given .. dbg, true)
 end
 
 -- Пополнение: pim.pushItem толкает предмет из слота игрока в соседний инвентарь (ME Interface).
@@ -2168,7 +2170,20 @@ local function methodsCli()
   else print("getAvailableItems нет") end
 end
 
-if ARGS[1] == "methods" then methodsCli()
+-- диагностика: lua shop.lua kits - что реально сохранено в комплектах (id, damage, var/хеш)
+local function kitsCli()
+  db = loadDB()
+  for _, k in ipairs(db.kits) do
+    print("Комплект #" .. k.id .. " " .. k.name)
+    for _, it in ipairs(k.items) do
+      print("  " .. tostring(it.label) .. "  " .. it.name .. ":" .. it.damage .. "  x" .. it.qty ..
+            "  var=[" .. tostring(it.var or "") .. "]")
+    end
+  end
+end
+
+if ARGS[1] == "kits" then kitsCli()
+elseif ARGS[1] == "methods" then methodsCli()
 elseif ARGS[1] == "owner" then ownerCli()
 elseif ARGS[1] == "autostart" then autostartCli()
 elseif ARGS[1] == "missing" then missingCli()
