@@ -62,6 +62,17 @@ local gpu = component.gpu
 local me  = component.me_interface
 local pim = component.pim
 
+-- Русские названия предметов: словарь "<id>&&<damage>" -> название (см. build_ru_from_nei.py).
+-- Файл необязателен: без него названия остаются такими, как их отдаёт ME.
+local RU = {}
+do
+  local okRu, t = pcall(dofile, "/home/kitshop/ru_names.lua")
+  if okRu and type(t) == "table" then RU = t end
+end
+local function ruName(name, dmg, fallback)
+  return RU[tostring(name) .. "&&" .. math.floor(tonumber(dmg) or 0)] or fallback
+end
+
 ----------------------------------------------------------------------
 -- УТИЛИТЫ
 ----------------------------------------------------------------------
@@ -99,7 +110,7 @@ local function variantOf(it)
 end
 
 local function labelOf(it, var)
-  local l = tostring(it.label or it.name)
+  local l = ruName(it.name, it.damage, tostring(it.label or it.name))
   if var and var ~= "" then l = l .. " (" .. var .. ")" end
   return l
 end
@@ -329,7 +340,7 @@ local function pickerScan(filter)
         local label = labelOf(it, var)
         local match = true
         if #words > 0 then
-          local hay = searchNorm(label .. " " .. name)
+          local hay = searchNorm(label .. " " .. tostring(it.label) .. " " .. name)
           for _, w in ipairs(words) do
             if not hay:find(w, 1, true) then match = false; break end
           end
@@ -1582,6 +1593,18 @@ end
 ----------------------------------------------------------------------
 local function main()
   db = loadDB()
+  -- переводим уже сохранённые названия (комплекты, пополнение, незабранные покупки)
+  do
+    local function tr(list)
+      for _, x in ipairs(list) do x.label = ruName(x.name, x.damage, x.label) end
+    end
+    for _, k in ipairs(db.kits) do tr(k.items) end
+    tr(db.topup)
+    for _, p in pairs(db.players) do
+      for _, pu in ipairs(p.purchases or {}) do tr(pu.items) end
+    end
+    pcall(saveDB)
+  end
   if #CONFIG.OWNERS == 0 and #db.owners == 0 then
     print("ВНИМАНИЕ: владелец не задан. Остановите программу и выполните:")
     print("  lua kitshop.lua owner add ВашНик")
