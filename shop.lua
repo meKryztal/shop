@@ -387,6 +387,7 @@ end
 -- fname/fdmg - необязательный фильтр по одному предмету.
 local detailCache = {}
 local function meList(fname, fdmg)
+  collectgarbage()
   local ok, base
   if fname then ok, base = pcall(me.getItemsInNetwork, { name = fname, damage = fdmg })
   else ok, base = pcall(me.getItemsInNetwork) end
@@ -425,18 +426,7 @@ local function meList(fname, fdmg)
     end
   end
   -- если NBT-предметы через getAvailableItems не нашлись, лучше вернуть всё как есть
-  raw = nil                                -- освобождаем самый большой список до дальнейшей работы
-  if tagged == 0 then
-    -- NBT-предметы без хеша нельзя выдавать как обычные (выйдет пустой бак).
-    -- Фильтруем base НА МЕСТЕ, без копии - иначе на большой сети не хватает RAM.
-    local n = 0
-    for i = 1, #base do
-      local it = base[i]
-      base[i] = nil
-      if type(it) == "table" and not it.hasTag then n = n + 1; base[n] = it end
-    end
-    return base
-  end
+  if tagged == 0 then return base end
   return out
 end
 
@@ -990,47 +980,33 @@ end
 -- бак с жидкостью), ищем хеш среди предметов сети: перебираем getAvailableItems() с тем же id+dmg
 -- и сравниваем жидкость в getItemDetail() с нужной.
 local lastExportErr
-local function rawAvailable()
-  if me.getAvailableItems == nil then return nil end
-  local ok, list = pcall(me.getAvailableItems)
-  if ok and type(list) == "table" then return list end
-  return nil
-end
-
--- Возвращает fingerprint для exportItem либо nil, "причина".
---  "#хеш"   -> ищем в getAvailableItems запись с этим хешем и берём её fingerprint КАК ЕСТЬ
---  ""       -> обычный предмет без NBT: {id, dmg}
---  жидкость -> (старые записи) ищем бак с такой жидкостью; не нашли - НЕ выдаём пустой бак
 local function meFingerprint(name, dmg, var)
   var = var or ""
   if var == "" then return { id = name, dmg = dmg } end
-  local list = rawAvailable()
-  if var:sub(1, 1) == "#" then
-    local hash = var:sub(2)
-    for _, e in ipairs(list or {}) do
-      local f = type(e) == "table" and e.fingerprint
-      if type(f) == "table" and f.id == name and tostring(f.nbt_hash) == hash then return f end
-    end
-    if list == nil then return { id = name, dmg = dmg, nbt_hash = hash } end
-    return nil, "предмет с хешем " .. hash:sub(1, 8) .. " не найден в ME"
+  local ok, list = pcall(me.getAvailableItems)
+  if not ok or type(list) ~= "table" then
+    if var:sub(1, 1) == "#" then return { id = name, dmg = dmg, nbt_hash = var:sub(2) } end
+    return nil, "ME не отдала список"
   end
+  local hash = var:sub(1, 1) == "#" and var:sub(2) or nil
   local want = lower(var)
-  for _, e in ipairs(list or {}) do
+  for _, e in ipairs(list) do
     local f = type(e) == "table" and e.fingerprint
-    if type(f) == "table" and f.id == name and math.floor(tonumber(f.dmg) or 0) == dmg and f.nbt_hash then
-      local ok2, d = pcall(me.getItemDetail, f)
-      if ok2 and type(d) == "table" then
-        if d.all ~= nil then
-          local ok3, all = pcall(d.all); if ok3 then d = all end
+    if type(f) == "table" and f.id == name then
+      if hash then
+        if tostring(f.nbt_hash) == hash then return f end
+      elseif f.nbt_hash and math.floor(tonumber(f.dmg) or 0) == dmg then
+        local ok2, d = pcall(me.getItemDetail, f)
+        if ok2 and type(d) == "table" then
+          if d.all ~= nil then local ok3, all = pcall(d.all); if ok3 then d = all end end
+          local fc = d.fluid_container
+          local raw = type(fc) == "table" and type(fc.contents) == "table" and lower(tostring(fc.contents.rawName or "")) or ""
+          if lower(fluidVariant(d)) == want or raw == want then return f end
         end
-        local fl = lower(fluidVariant(d))
-        local fc = type(d) == "table" and d.fluid_container
-        local raw = type(fc) == "table" and type(fc.contents) == "table" and lower(tostring(fc.contents.rawName or "")) or ""
-        if fl == want or raw == want then return f end
       end
     end
   end
-  return nil, "не найден бак с жидкостью «" .. var .. "»"
+  return nil, "бак не найден в ME (var=" .. var:sub(1, 12) .. ")"
 end
 
 local function doClaim(pu, it)
@@ -1051,10 +1027,7 @@ local function doClaim(pu, it)
   end
 
   local fp, fpErr = meFingerprint(it.name, it.damage, it.var)
-  if not fp then
-    return flash("Не могу выдать «" .. it.label .. "»: " .. tostring(fpErr) ..
-                 ". Пересоздайте ресурс в комплекте через «Добавить из ME».", false)
-  end
+  if not fp then return flash("Не могу выдать «" .. it.label .. "»: " .. tostring(fpErr), false) end
   local deliver = math.min(it.qty, space, real)
   local before = countIn(slots, it.name, it.damage, it.var)
 
@@ -1084,7 +1057,7 @@ local function doClaim(pu, it)
   if given == 0 then
     local extra = ""
     if S.player.owner then
-      extra = " [var=" .. tostring(it.var) .. ", hash=" .. tostring(fp.nbt_hash) .. (lastExportErr and (", " .. lastExportErr:sub(1, 80)) or "") .. "]"
+      extra = " [hash=" .. tostring(fp.nbt_hash) .. (lastExportErr and (", " .. lastExportErr:sub(1, 80)) or "") .. "]"
     end
     return flash("Не удалось выдать «" .. it.label .. "». Попробуйте ещё раз." .. extra, false)
   elseif it.qty > 0 then
@@ -1728,7 +1701,7 @@ local function screenPick()
     local e = list[i]
     local y = LIST_Y + (i - first) * 4
     -- одна строка, как у остальных карточек
-    lineCard(y, e[3] .. "   [" .. e[1] .. ":" .. e[2] .. ((e[6] or "") ~= "" and (" " .. e[6]:sub(1, 9)) or "") .. "]", (fromInv and "У вас: " or "В ME: ") .. e[4], C.text)
+    lineCard(y, e[3] .. "   [" .. e[1] .. ":" .. e[2] .. "]", (fromInv and "У вас: " or "В ME: ") .. e[4], C.text)
     rb(y, 0, BW, "Выбрать", { bg = C.tabOn, fn = function() pickItem(e) end })
   end
   S.backFn = function()
