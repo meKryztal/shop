@@ -19,6 +19,7 @@ local ser       = require("serialization")
 local unicode   = require("unicode")
 
 local ARGS = { ... }               -- аргументы командной строки
+local SELF_SRC = debug.getinfo(1, "S").source   -- откуда загружен файл (нужно для автозапуска)
 
 -- Оригинальные обработчики прерывания запоминаем ОДИН раз (до возможных перезапусков main)
 local ORIG_INT, ORIG_SOFT = event.shouldInterrupt, event.shouldSoftInterrupt
@@ -117,10 +118,26 @@ local function itemKey(name, dmg, var)
   return k
 end
 
--- Вариант предмета из ME: по таблице fluid (тип жидкости, без количества).
+-- NBT-хеш предмета (если ME / PIM его отдают). Нужен, чтобы отличать предметы с одинаковыми id и damage.
+local function nbtOf(it)
+  if type(it) ~= "table" then return nil end
+  for _, k in ipairs({ "nbt_hash", "nbtHash", "hash", "nbt" }) do
+    local v = it[k]
+    if v ~= nil and type(v) ~= "table" and tostring(v) ~= "" then return tostring(v) end
+  end
+  return nil
+end
+
+-- Вариант предмета (ME-стек или стек из PIM):
+--   1) по таблице fluid - тип жидкости (без количества): "Water";
+--   2) иначе по NBT-хешу: "#<хеш>" (разные баки/капсулы/чары с одним id+damage);
+--   3) иначе "" (обычный предмет).
 local function variantOf(it)
   local f = type(it) == "table" and it.fluid
-  if type(f) ~= "table" then return "" end
+  if type(f) ~= "table" then
+    local h = nbtOf(it)
+    return h and ("#" .. h) or ""
+  end
   local nm = f.name or f.fluid or f.fluidName or f.fluid_name or f.id or f.label or f.localizedName
   if nm ~= nil and type(nm) ~= "table" then return tostring(nm) end
   local parts = {}
@@ -137,8 +154,21 @@ end
 
 local function labelOf(it, var)
   local l = ruName(it.name, it.damage, tostring(it.label or it.name))
-  if var and var ~= "" then l = l .. " (" .. var .. ")" end
+  if var and var ~= "" then
+    l = l .. " (" .. ((var:sub(1, 1) == "#") and var:sub(1, 7) or var) .. ")"
+  end
   return l
+end
+
+-- совпадают ли варианты предметов: оба по хешу - строго; оба по жидкости - строго;
+-- если у одного хеш, а у другого жидкость (PIM и ME описывают предмет по-разному) - считаем совпадением
+local function sameVariant(a, b)
+  a, b = a or "", b or ""
+  if a == b then return true end
+  if a == "" or b == "" then return false end
+  local ha, hb = (a:sub(1, 1) == "#"), (b:sub(1, 1) == "#")
+  if ha ~= hb then return true end
+  return false
 end
 
 -- обрезать/дополнить пробелами до ширины w (учитывает кириллицу)
@@ -408,6 +438,28 @@ local function meCount(name, damage, var)
   return total
 end
 
+-- Подбирает вариант предмета из ME под вариант из инвентаря (PIM и ME могут описывать
+-- один и тот же предмет по-разному: жидкость / хеш). Возвращает вариант ME и остаток, либо nil.
+local function meResolve(name, damage, var)
+  var = var or ""
+  local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
+  if not ok or type(list) ~= "table" then return nil end
+  local sizes, order = {}, {}
+  for _, it in ipairs(list) do
+    if it.name == name and math.floor(tonumber(it.damage) or 0) == damage then
+      local v = variantOf(it)
+      if sizes[v] == nil then sizes[v] = 0; order[#order + 1] = v end
+      sizes[v] = sizes[v] + (tonumber(it.size) or 0)
+    end
+  end
+  if sizes[var] then return var, sizes[var] end
+  if #order == 1 then return order[1], sizes[order[1]] end
+  for _, v in ipairs(order) do
+    if sameVariant(v, var) then return v, sizes[v] end
+  end
+  return nil
+end
+
 local function availFn()
   local res = reservedMap()
   return function(key)
@@ -443,18 +495,18 @@ end
 local function stackInfo(st)
   local dmg = st.dmg or st.damage or 0
   return st.id or st.name, math.floor(tonumber(dmg) or 0), tonumber(st.qty or st.size) or 1,
-         tonumber(st.max_size or st.maxSize) or 64
+         tonumber(st.max_size or st.maxSize) or 64, variantOf(st)
 end
 
--- читает 36 слотов: slots[s] = false (пусто) | {name,damage,qty,max} | nil (ошибка чтения)
+-- читает 36 слотов: slots[s] = false (пусто) | {name,damage,qty,max,var} | nil (ошибка чтения)
 local function readSlots()
   local slots = {}
   for s = 1, 36 do
     local ok, st = pcall(pim.getStackInSlot, s)
     if ok then
       if st then
-        local n, d, q, mx = stackInfo(st)
-        slots[s] = { name = n, damage = d, qty = q, max = mx }
+        local n, d, q, mx, v = stackInfo(st)
+        slots[s] = { name = n, damage = d, qty = q, max = mx, var = v }
       else
         slots[s] = false
       end
@@ -463,39 +515,38 @@ local function readSlots()
   return slots
 end
 
-local function countIn(slots, name, damage)
+-- подходит ли стек из слота под запись (id + damage + вариант: жидкость / NBT-хеш)
+local function stackMatches(st, name, damage, var)
+  if not st or st.name ~= name or st.damage ~= damage then return false end
+  var = var or ""
+  local sv = st.var or ""
+  if sv == var then return true end
+  -- PIM не всегда отдаёт тип жидкости: стек без варианта подходит под запись с жидкостью
+  if sv == "" and var ~= "" and var:sub(1, 1) ~= "#" then return true end
+  return sameVariant(sv, var)
+end
+
+local function countIn(slots, name, damage, var)
   local c = 0
   for s = 1, 36 do
     local st = slots[s]
-    if st and st.name == name and st.damage == damage then c = c + st.qty end
+    if stackMatches(st, name, damage, var) then c = c + st.qty end
   end
   return c
 end
 
 -- сколько штук предмета ещё влезет в инвентарь (пустые слоты + недобитые стаки)
-local function spaceIn(slots, name, damage, maxSize)
+local function spaceIn(slots, name, damage, maxSize, var)
   local space = 0
   for s = 1, 36 do
     local st = slots[s]
     if st == false then
       space = space + maxSize
-    elseif st and st.name == name and st.damage == damage then
+    elseif stackMatches(st, name, damage, var) then
       space = space + math.max(0, maxSize - st.qty)
     end
   end
   return space
-end
-
-local function invMap(slots)
-  local m = {}
-  for s = 1, 36 do
-    local st = slots[s]
-    if st then
-      local k = itemKey(st.name, st.damage)
-      m[k] = (m[k] or 0) + st.qty
-    end
-  end
-  return m
 end
 
 -- количество конкретного предмета в одном слоте (nil - ошибка чтения)
@@ -520,9 +571,10 @@ local function invPickerScan(filter)
     for s = 1, 36 do
       local ok, st = pcall(pim.getStackInSlot, s)
       if ok and st then
-        local name, dmg, qty, mx = stackInfo(st)
+        local name, dmg, qty, mx, var = stackInfo(st)
         if name then
-          local label = ruName(name, dmg, tostring(st.display_name or st.label or st.rawName or name))
+          local label = labelOf({ name = name, damage = dmg,
+                                  label = st.display_name or st.label or st.rawName or name }, var)
           local match = true
           if #words > 0 then
             local hay = searchNorm(label .. " " .. tostring(name))
@@ -531,12 +583,12 @@ local function invPickerScan(filter)
             end
           end
           if match then
-            local k = itemKey(name, dmg, "")
+            local k = itemKey(name, dmg, var)
             local e = seen[k]
             if e then
               e[4] = e[4] + qty
             else
-              e = { name, dmg, label, qty, mx, "" }
+              e = { name, dmg, label, qty, mx, var }
               seen[k] = e
               out[#out + 1] = e
             end
@@ -640,10 +692,18 @@ end
 -- Строка прижата к левому краю карточки и стоит по центру полоски по вертикали
 -- (средняя из трёх). reserve - сколько колонок справа занято кнопками.
 local KIT_GAP = 10
-local function lineCard(y, title, info, infoColor, reserve)
+local PENCIL_W = 3
+local function lineCard(y, title, info, infoColor, reserve, onEdit)
   reserve = reserve or (BW + 2)
   fill(2, y, W - 2, 3, C.panel)
-  local rw = math.max(10, W - reserve - 1)             -- ширина области: колонки 2 .. rw+1
+  local x0 = 3                                          -- левый край (как у остальных карточек)
+  local shift = 0
+  if onEdit then                                        -- маленький карандаш слева: переименовать
+    addBtn(x0, y, PENCIL_W, 3, "✎", { bg = C.blue, fg = 0xffffff, fn = onEdit })
+    shift = PENCIL_W + 1
+    x0 = x0 + shift
+  end
+  local rw = math.max(10, W - reserve - 1 - shift)      -- ширина области: колонки 2 .. rw+1
   title, info = tostring(title), tostring(info)
   local li = unicode.len(info)
   local room = rw - 2 - KIT_GAP - li
@@ -653,7 +713,6 @@ local function lineCard(y, title, info, infoColor, reserve)
   end
   if unicode.len(title) > room then title = unicode.sub(title, 1, room) end
   local lt = unicode.len(title)
-  local x0 = 3                                          -- левый край (как у остальных карточек)
   text(x0, y + 1, title, C.accent, C.panel)
   text(x0 + lt + KIT_GAP, y + 1, info, infoColor or C.text, C.panel)
 end
@@ -791,7 +850,7 @@ end
 ----------------------------------------------------------------------
 local function scanInventory()
   status("Читаю инвентарь...")
-  S.inv = invMap(readSlots())
+  S.slots = readSlots()
 end
 
 local function verifyStock(kit)
@@ -823,7 +882,8 @@ local function doBuy(kit)
   local pu = { id = db.nextPurchaseId, kit = kit.name, items = {} }
   db.nextPurchaseId = db.nextPurchaseId + 1
   for _, it in ipairs(kit.items) do
-    pu.items[#pu.items + 1] = { name = it.name, damage = it.damage, var = it.var, label = it.label, qty = it.qty }
+    pu.items[#pu.items + 1] = { name = it.name, damage = it.damage, var = it.var, label = it.label,
+                                customLabel = it.customLabel, qty = it.qty }
   end
   p.purchases[#p.purchases + 1] = pu
   saveDB()
@@ -838,7 +898,7 @@ local function doClaim(pu, it)
 
   status("Проверяю место в инвентаре...")
   local slots = readSlots()
-  local space = spaceIn(slots, it.name, it.damage, maxSize)
+  local space = spaceIn(slots, it.name, it.damage, maxSize, it.var)
   if space <= 0 then
     return flash("Нет места в инвентаре. Освободите слот и нажмите «Забрать» ещё раз.", false)
   end
@@ -849,7 +909,7 @@ local function doClaim(pu, it)
   end
 
   local deliver = math.min(it.qty, space, real)
-  local before = countIn(slots, it.name, it.damage)
+  local before = countIn(slots, it.name, it.damage, it.var)
 
   -- сначала списываем в базе (чтобы при сбое питания выдача не удвоилась)
   it.qty = it.qty - deliver
@@ -857,6 +917,7 @@ local function doClaim(pu, it)
 
   status("Выдаю...")
   local fp, left = { id = it.name, dmg = it.damage }, deliver
+  if it.var and it.var:sub(1, 1) == "#" then fp.nbt_hash = it.var:sub(2) end   -- точный вариант (NBT)
   while left > 0 do
     local chunk = math.min(left, maxSize)
     local ok, res = pcall(me.exportItem, fp, CONFIG.ME_EXPORT_SIDE, chunk)
@@ -867,7 +928,7 @@ local function doClaim(pu, it)
   end
 
   -- реально выданное считаем по разнице в инвентаре, остаток возвращаем в долг магазина
-  local after = countIn(readSlots(), it.name, it.damage)
+  local after = countIn(readSlots(), it.name, it.damage, it.var)
   local given = math.max(0, math.min(deliver, after - before))
   if given < deliver then it.qty = it.qty + (deliver - given) end
   if cache.byKey[key] then cache.byKey[key].size = math.max(0, cache.byKey[key].size - given) end
@@ -922,7 +983,7 @@ end
 local function doDeposit(e, amount)
   status("Читаю инвентарь...")
   local before = readSlots()
-  local have = countIn(before, e.name, e.damage)
+  local have = countIn(before, e.name, e.damage, e.var)
   local want = amount and math.min(amount, have) or have
   if want <= 0 then return flash("В инвентаре нет «" .. e.label .. "».", false) end
 
@@ -932,15 +993,15 @@ local function doDeposit(e, amount)
   for s = 1, 36 do
     if left <= 0 then break end
     local st = before[s]
-    if st and st.name == e.name and st.damage == e.damage then
+    if stackMatches(st, e.name, e.damage, e.var) then
       left = left - pushFromSlot(s, math.min(st.qty, left), e.name, e.damage)
     end
   end
 
   local afterSlots = readSlots()
-  local after = countIn(afterSlots, e.name, e.damage)
+  local after = countIn(afterSlots, e.name, e.damage, e.var)
   local moved = math.max(0, math.min(want, have - after))
-  S.inv = invMap(afterSlots)
+  S.slots = afterSlots
   if moved <= 0 then
     local msg = "Не удалось принять предметы. Проверьте подключение ME Interface к PIM и свободное место в ME."
     if S.player.owner and lastPushErr then msg = msg .. " [" .. lastPushErr:sub(1, 80) .. "]" end
@@ -1326,7 +1387,7 @@ local function screenTopup()
   for i = first, last do
     local e = list[i]
     local y = LIST_Y + (i - first) * 4
-    local have = (S.inv or {})[itemKey(e.name, e.damage)] or 0
+    local have = countIn(S.slots or {}, e.name, e.damage, e.var)
     lineCard(y, e.label, "Цена: " .. fmt(e.price) .. " " .. CONFIG.CURRENCY .. " за шт   У вас в инвентаре: " .. have .. " шт",
              have > 0 and C.text or C.dim, reserve)
     local off = rb(y, 0, BW, "Ввести число", { disabled = have <= 0, fn = function()
@@ -1356,6 +1417,24 @@ local function subBar()
     { bg = exitArmed and C.red or C.panel2, fn = function()
       if S.confirm == "exit" then running = false else S.confirm = "exit"; render() end
     end })
+end
+
+-- переименование ресурса (запись комплекта или ресурса пополнения) по карандашу на карточке.
+-- Пустое название - вернуть автоматическое (русское из словаря / из ME).
+local function renameEntry(entry)
+  local nm = prompt("Название ресурса (пусто - сбросить):", entry.label, 60)
+  if nm == nil then return render() end
+  nm = trim(nm)
+  if nm == "" then
+    local c = cache.byKey[itemKey(entry.name, entry.damage, entry.var)]
+    entry.label = ruName(entry.name, entry.damage, (c and c.label) or entry.label)
+    entry.customLabel = nil
+  else
+    entry.label = nm
+    entry.customLabel = true
+  end
+  saveDB()
+  render()
 end
 
 local function screenKitEdit()
@@ -1399,7 +1478,8 @@ local function screenKitEdit()
     local c = cache.byKey[itemKey(it.name, it.damage, it.var)]
     -- одна строка, как у остальных карточек
     lineCard(y, it.label .. "   [" .. it.name .. ":" .. it.damage .. "]",
-             "x" .. it.qty .. "   В ME: " .. (c and c.size or 0), C.text, reserve)
+             "x" .. it.qty .. "   В ME: " .. (c and c.size or 0), C.text, reserve,
+             function() renameEntry(it) end)
     local off = rb(y, 0, BW2, "Убрать", { fn = function()
       table.remove(kit.items, i); saveDB(); render()
     end })
@@ -1418,8 +1498,19 @@ local function pickItem(e)
   local name, dmg, label, size, mx, var = e[1], e[2], e[3], e[4], e[5], e[6] or ""
   local k = itemKey(name, dmg, var)
   if S.pickSource == "inv" then
-    -- size в списке - это количество у игрока на руках, а остаток в ME берём отдельно
-    size = meCount(name, dmg, var) or 0
+    -- size в списке - это количество у игрока на руках, а остаток в ME берём отдельно.
+    -- Вариант (жидкость/хеш) приводим к тому, каким его видит ME, иначе остатки не сойдутся.
+    local mv, msize = meResolve(name, dmg, var)
+    if mv then
+      var = mv; size = msize
+      local base = e[3]
+      if (e[6] or "") ~= "" then base = (base:gsub(" %b()$", "")) end   -- убираем вариант PIM из названия
+      label = base
+      if var ~= "" then label = label .. " (" .. ((var:sub(1, 1) == "#") and var:sub(1, 7) or var) .. ")" end
+    else
+      size = 0
+    end
+    k = itemKey(name, dmg, var)
     if cache.byKey[k] then cache.byKey[k].size = size end
   end
   if not cache.byKey[k] then
@@ -1533,7 +1624,8 @@ local function screenCreate()
       local e = db.topup[i]
       local y = SUB_Y + (i - first) * 4
       lineCard(y, e.label .. " [" .. e.name .. ":" .. e.damage .. "]",
-               "Цена за 1 шт: " .. fmt(e.price) .. " " .. CONFIG.CURRENCY, C.text, reserve)
+               "Цена за 1 шт: " .. fmt(e.price) .. " " .. CONFIG.CURRENCY, C.text, reserve,
+               function() renameEntry(e) end)
       local off = rb(y, 0, BW2, "Убрать", { fn = function() table.remove(db.topup, i); saveDB(); render() end })
       rb(y, off, BW2, "Цена", { fn = function()
         local v = askNumber("Новая цена за 1 шт «" .. e.label .. "»:", fmt(e.price), false)
@@ -1611,7 +1703,7 @@ local function onPlayerOn(e)
   local name, uid = parsePlayerOn(e)
   S = { player = { name = name, uid = uid, owner = isOwner(name, uid) },
         tab = "kits", view = "list", csub = "kits", page = 1, pages = 1,
-        msg = "", msgOk = true, inv = {}, filter = "" }
+        msg = "", msgOk = true, slots = {}, filter = "" }
   UI.btns = {}
   UI.oy = 0
   cache.items = {}
@@ -1681,7 +1773,9 @@ local function main()
   -- переводим уже сохранённые названия (комплекты, пополнение, незабранные покупки)
   do
     local function tr(list)
-      for _, x in ipairs(list) do x.label = ruName(x.name, x.damage, x.label) end
+      for _, x in ipairs(list) do
+        if not x.customLabel then x.label = ruName(x.name, x.damage, x.label) end
+      end
     end
     for _, k in ipairs(db.kits) do tr(k.items) end
     tr(db.topup)
@@ -1734,6 +1828,98 @@ local function main()
   gpu.setBackground(0x000000); gpu.setForeground(0xFFFFFF)
   gpu.fill(1, 1, W, H, " ")
   print("KitShop остановлен.")
+end
+
+----------------------------------------------------------------------
+-- АВТОЗАПУСК: строка в /home/.shrc (OpenOS выполняет её при каждой загрузке)
+----------------------------------------------------------------------
+local RC_PATH   = "/home/.shrc"
+local RC_MARK   = "# kitshop-autostart"
+local NOAUTO    = "/home/kitshop/noautostart"      -- флаг: владелец отключил автозапуск
+
+local function selfPath()
+  local src = tostring(SELF_SRC or ""):gsub("^[@=]", "")
+  if src == "" then return nil end
+  if src:sub(1, 1) ~= "/" then
+    local ok, shell = pcall(require, "shell")
+    if ok and shell and shell.resolve then src = shell.resolve(src) end
+  end
+  return fs.canonical(src)
+end
+
+local function readRc()
+  local lines = {}
+  local f = io.open(RC_PATH, "r")
+  if f then
+    for l in f:lines() do lines[#lines + 1] = l end
+    f:close()
+  end
+  return lines
+end
+
+local function writeRc(lines)
+  local f = io.open(RC_PATH, "w")
+  if not f then return false end
+  f:write(table.concat(lines, "\n"))
+  if #lines > 0 then f:write("\n") end
+  f:close()
+  return true
+end
+
+-- включает/выключает автозапуск; возвращает (ok, текст)
+local function setAutostart(on, path)
+  path = path or selfPath()
+  local lines, out = readRc(), {}
+  local skip = false
+  for _, l in ipairs(lines) do
+    if l:find(RC_MARK, 1, true) then skip = true          -- строка-метка и следующая за ней (команда)
+    elseif skip then skip = false
+    else out[#out + 1] = l end
+  end
+  if on then
+    if not path then return false, "Не удалось определить путь к файлу. Укажите: lua shop.lua autostart on /путь/к/shop.lua" end
+    out[#out + 1] = RC_MARK
+    out[#out + 1] = path
+    pcall(fs.makeDirectory, fs.path(NOAUTO))
+    pcall(fs.remove, NOAUTO)
+  else
+    pcall(fs.makeDirectory, fs.path(NOAUTO))
+    local f = io.open(NOAUTO, "w"); if f then f:write("1"); f:close() end
+  end
+  if not writeRc(out) then return false, "Не удалось записать " .. RC_PATH end
+  return true, on and ("Автозапуск включён: " .. path) or "Автозапуск выключен."
+end
+
+local function autostartEnabled()
+  for _, l in ipairs(readRc()) do
+    if l:find(RC_MARK, 1, true) then return true end
+  end
+  return false
+end
+
+-- при обычном запуске сам настраивает автозапуск (если его не отключали командой autostart off)
+local function ensureAutostart()
+  if fs.exists(NOAUTO) or autostartEnabled() then return end
+  local path = selfPath()
+  if path and fs.exists(path) then pcall(setAutostart, true, path) end
+end
+
+-- команда: lua shop.lua autostart on|off|status [путь]
+local function autostartCli()
+  local cmd = ARGS[2]
+  if cmd == "on" then
+    local ok, msg = setAutostart(true, ARGS[3] and fs.canonical(ARGS[3]) or nil)
+    print(msg)
+  elseif cmd == "off" then
+    local _, msg = setAutostart(false)
+    print(msg)
+  elseif cmd == "status" then
+    print(autostartEnabled() and "Автозапуск включён." or "Автозапуск выключен.")
+    local rc = readRc()
+    for i, l in ipairs(rc) do if l:find(RC_MARK, 1, true) and rc[i + 1] then print("  " .. rc[i + 1]) end end
+  else
+    print("Использование: lua shop.lua autostart on|off|status [путь]")
+  end
 end
 
 -- команда: lua kitshop.lua owner add|del|list [Ник]
@@ -1840,9 +2026,13 @@ local function missingCli()
 end
 
 if ARGS[1] == "owner" then ownerCli()
+elseif ARGS[1] == "autostart" then autostartCli()
 elseif ARGS[1] == "missing" then missingCli()
 elseif ARGS[1] == "dump" then dumpCli()
 elseif ARGS[1] == "debug" then            -- без автоперезапуска, Ctrl+Alt+C работает
   local ok, err = xpcall(main, debug.traceback)
   if not ok then print(err) end
-else supervised() end
+else
+  pcall(ensureAutostart)
+  supervised()
+end
