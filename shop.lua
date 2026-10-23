@@ -219,6 +219,23 @@ local function loadDB()
       local t = ser.unserialize(data)
       if type(t) == "table" then
         for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
+        -- чиним старые/битые записи: любое пустое поле-список должно быть таблицей,
+        -- иначе ipairs(nil) даёт "bad argument #1 to 'for iterator' (table expected, got nil)"
+        local function tbl(x) return type(x) == "table" and x or {} end
+        for _, key in ipairs({ "owners", "ownerUids", "kits", "topup", "players", "feedback" }) do
+          t[key] = tbl(t[key])
+        end
+        for _, k in ipairs(t.kits) do
+          k.items = tbl(k.items)
+          for _, it in ipairs(k.items) do it.qty = tonumber(it.qty) or 0 end
+        end
+        for _, p in pairs(t.players) do
+          p.purchases = tbl(p.purchases)
+          for _, pu in ipairs(p.purchases) do
+            pu.items = tbl(pu.items)
+            for _, it in ipairs(pu.items) do it.qty = tonumber(it.qty) or 0 end
+          end
+        end
         return t
       end
       -- файл повреждён: не затираем, а откладываем в сторону
