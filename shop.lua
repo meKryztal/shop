@@ -2194,19 +2194,29 @@ local function avail_dump(v, ind, depth)
 end
 local function availCli()
   local f = lower(ARGS[2] or "tank")
+  -- каждый вызов getAvailableItems возвращает огромную таблицу: проверяем по одному
+  -- и сразу отпускаем результат, иначе не хватает памяти
   for _, mode in ipairs({ "ALL", "PROXY", "NONE" }) do
     local ok, r = pcall(me.getAvailableItems, mode)
     print("getAvailableItems(" .. mode .. "): ok=" .. tostring(ok) .. " тип=" .. type(r) ..
           (type(r) ~= "table" and (" значение=" .. tostring(r):sub(1, 200)) or ""))
+    r = nil
+    collectgarbage()
   end
-  local ok0, r0 = pcall(me.getAvailableItems)
-  print("getAvailableItems(): ok=" .. tostring(ok0) .. " тип=" .. type(r0))
+  do
+    local ok0, r0 = pcall(me.getAvailableItems)
+    print("getAvailableItems(): ok=" .. tostring(ok0) .. " тип=" .. type(r0))
+    r0 = nil
+    collectgarbage()
+  end
 
   local list, mode = getAvail()
   if not list then print("Ни один вариант не вернул таблицу."); return end
   print("Использую режим: " .. tostring(mode))
-  local shown = 0
+  local shown, n = 0, 0
   for _, e in pairs(list) do
+    n = n + 1
+    if n % 50 == 0 then collectgarbage() end
     local line = avail_dump(e, "", 0)
     if lower(line):find(f, 1, true) then
       print(line:sub(1, 700))
@@ -2238,3 +2248,4 @@ else
   pcall(ensureAutostart)
   supervised()
 end
+
