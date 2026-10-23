@@ -2184,7 +2184,42 @@ local function kitsCli()
   end
 end
 
-if ARGS[1] == "kits" then kitsCli()
+-- диагностика: lua shop.lua fp [часть id] - все поля предмета в getAvailableItems и getItemsInNetwork
+local function fpCli()
+  local f = lower(ARGS[2] or "tank")
+  local function flat(t)
+    local parts = {}
+    for k, v in pairs(t) do
+      if type(v) == "table" then
+        local sub = {}
+        for k2, v2 in pairs(v) do sub[#sub + 1] = tostring(k2) .. "=" .. tostring(v2) end
+        table.sort(sub); parts[#parts + 1] = tostring(k) .. "={" .. table.concat(sub, ", ") .. "}"
+      else parts[#parts + 1] = tostring(k) .. "=" .. tostring(v) end
+    end
+    table.sort(parts); return table.concat(parts, "  ")
+  end
+  print("== getAvailableItems ==")
+  local ok, list = pcall(me.getAvailableItems)
+  local n = 0
+  if ok and type(list) == "table" then
+    for _, e in ipairs(list) do
+      local fp = e.fingerprint
+      if type(fp) == "table" and lower(tostring(fp.id)):find(f, 1, true) then
+        print(flat(e)); n = n + 1; if n >= 8 then break end
+      end
+    end
+  else print("ошибка: " .. tostring(list)) end
+  print("== getItemsInNetwork ==")
+  n = 0
+  for _, it in ipairs(me.getItemsInNetwork()) do
+    if lower(tostring(it.name)):find(f, 1, true) then
+      print(flat(it)); n = n + 1; if n >= 8 then break end
+    end
+  end
+end
+
+if ARGS[1] == "fp" then fpCli()
+elseif ARGS[1] == "kits" then kitsCli()
 elseif ARGS[1] == "methods" then methodsCli()
 elseif ARGS[1] == "owner" then ownerCli()
 elseif ARGS[1] == "autostart" then autostartCli()
