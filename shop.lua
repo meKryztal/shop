@@ -1740,7 +1740,48 @@ local function supervised()
   end
 end
 
+-- диагностика перевода: lua kitshop.lua missing
+-- показывает предметы ME, для которых нет русского названия в словаре, и пишет полный список
+-- в /home/kitshop/missing.txt (id&&damage<TAB>label<TAB>причина)
+local function missingCli()
+  local list = me.getItemsInNetwork()
+  local seen, rows = {}, {}
+  local total, translated = 0, 0
+  for _, it in ipairs(list) do
+    if type(it) == "table" and it.name then
+      local dmg = math.floor(tonumber(it.damage) or 0)
+      local k = tostring(it.name) .. "&&" .. dmg
+      if not seen[k] then
+        seen[k] = true
+        total = total + 1
+        if ru.item(it.name, dmg, nil) then
+          translated = translated + 1
+        else
+          local why
+          if ru.item(it.name, 0, nil) and dmg ~= 0 then why = "есть только meta 0"
+          else why = "id нет в словаре" end
+          rows[#rows + 1] = { k = k, label = tostring(it.label), why = why }
+        end
+      end
+    end
+  end
+  table.sort(rows, function(a, b) return a.k < b.k end)
+  local f = io.open("/home/kitshop/missing.txt", "w")
+  local byWhy = {}
+  for _, r in ipairs(rows) do
+    byWhy[r.why] = (byWhy[r.why] or 0) + 1
+    if f then f:write(r.k .. "\t" .. r.label .. "\t" .. r.why .. "\n") end
+  end
+  if f then f:close() end
+  print("Типов предметов в ME: " .. total .. ", переведено: " .. translated .. ", без перевода: " .. #rows)
+  for why, n in pairs(byWhy) do print("  " .. why .. ": " .. n) end
+  print("Первые 25 без перевода:")
+  for i = 1, math.min(25, #rows) do print("  " .. rows[i].k .. "  |  " .. rows[i].label .. "  |  " .. rows[i].why) end
+  print("Полный список: /home/kitshop/missing.txt")
+end
+
 if ARGS[1] == "owner" then ownerCli()
+elseif ARGS[1] == "missing" then missingCli()
 elseif ARGS[1] == "dump" then dumpCli()
 elseif ARGS[1] == "debug" then            -- без автоперезапуска, Ctrl+Alt+C работает
   local ok, err = xpcall(main, debug.traceback)
