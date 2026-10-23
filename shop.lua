@@ -346,13 +346,28 @@ local function wantedNames()
   return w
 end
 
+-- Безопасный перебор списка из ME: не падает на битых/нетабличных записях
+-- (ошибка "bad argument #N for iterator"), пропускает их.
+local function meEach(list)
+  local i, n = 0, 0
+  local okn, len = pcall(function() return #list end)
+  n = okn and len or 0
+  return function()
+    while i < n do
+      i = i + 1
+      local ok, it = pcall(function() return list[i] end)
+      if ok and type(it) == "table" then return i, it end
+    end
+  end
+end
+
 -- Лёгкий скан при входе: запоминаем остатки только нужных предметов.
 local function scanME()
   return pcall(function()
     local list = me.getItemsInNetwork()
     if type(list) ~= "table" then error("ME вернула " .. type(list)) end
     local want, by = wantedNames(), {}
-    for _, it in ipairs(list) do
+    for _, it in meEach(list) do
       local name = type(it) == "table" and it.name
       if name and want[name] then
         local dmg = math.floor(tonumber(it.damage) or 0)
@@ -389,7 +404,7 @@ local function pickerScan(filter)
     for w in searchNorm(filter or ""):gmatch("%S+") do words[#words + 1] = w end
 
     local out, seen = {}, {}
-    for _, it in pairs(list) do
+    for _, it in meEach(list) do
       local name = type(it) == "table" and it.name
       if name then
         local var = variantOf(it)
@@ -429,7 +444,7 @@ local function meCount(name, damage, var)
   local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
   if not ok or type(list) ~= "table" then return nil end
   local total = 0
-  for _, it in ipairs(list) do
+  for _, it in meEach(list) do
     if it.name == name and math.floor(tonumber(it.damage) or 0) == damage
        and variantOf(it) == (var or "") then
       total = total + (tonumber(it.size) or 0)
@@ -445,7 +460,7 @@ local function meResolve(name, damage, var)
   local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
   if not ok or type(list) ~= "table" then return nil end
   local sizes, order = {}, {}
-  for _, it in ipairs(list) do
+  for _, it in meEach(list) do
     if it.name == name and math.floor(tonumber(it.damage) or 0) == damage then
       local v = variantOf(it)
       if sizes[v] == nil then sizes[v] = 0; order[#order + 1] = v end
@@ -2043,7 +2058,7 @@ local function dumpCli()
   local f = lower(ARGS[2] or "")
   local list = me.getItemsInNetwork()
   local shown = 0
-  for _, it in ipairs(list) do
+  for _, it in meEach(list) do
     local hit
     if f == "fluid" then
       -- режим «fluid»: показать предметы, у которых есть жидкость или NBT-хеш
@@ -2092,7 +2107,7 @@ local function missingCli()
   local list = me.getItemsInNetwork()
   local seen, rows = {}, {}
   local total, translated = 0, 0
-  for _, it in ipairs(list) do
+  for _, it in meEach(list) do
     if type(it) == "table" and it.name then
       local dmg = math.floor(tonumber(it.damage) or 0)
       local k = tostring(it.name) .. "&&" .. dmg
