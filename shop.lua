@@ -1005,14 +1005,7 @@ local function drawIdle()
   drawStars(false)
   drawSplashFrame()
   drawTitle(g)
-  -- подзаголовок и разделитель
-  local sub = spaced("МАГАЗИН КОМПЛЕКТОВ")
-  gpu.setBackground(skyAt(g.subY)); gpu.setForeground(C.gold)
-  gpu.set(math.floor((W - unicode.len(sub)) / 2) + 1, g.subY, sub)
-  local div = string.rep("─", 18) .. "  ◆  " .. string.rep("─", 18)
-  gpu.setBackground(skyAt(g.divY)); gpu.setForeground(0x4a5a8a)
-  gpu.set(math.floor((W - unicode.len(div)) / 2) + 1, g.divY, div)
-  drawSplashPrompt(g, true)
+
 end
 
 -- вызывается раз в ~0.7 с, пока на PIM никого нет: мерцание звёзд и «дыхание» надписи
