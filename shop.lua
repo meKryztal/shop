@@ -631,7 +631,7 @@ local function prompt(title, initial, maxLen)
   local function draw()
     fill(bx, by, bw, bh, C.dlg)
     frame(bx, by, bw, bh, C.accent, C.dlg)                 -- рамка окна
-    text(bx + 2, by + 1, pad(title, bw - 4 - CROSS_W), C.gold, C.dlg)
+    text(bx + 2, by + 1, pad(title, bw - 6 - CROSS_W), C.gold, C.dlg)
     drawCross(bx, by, bw)
     frame(bx + 2, by + 2, bw - 4, 3, C.dim, C.dlg)         -- рамка поля ввода
     fill(bx + 3, by + 3, bw - 6, 1, 0x000000)
@@ -680,7 +680,7 @@ local function modal(title, body)
   local bx, by = math.floor((W - bw) / 2) + 1, math.max(2, math.floor((H - bh) / 2) + 1)
   fill(bx, by, bw, bh, C.dlg)
   frame(bx, by, bw, bh, C.gold, C.dlg)                     -- рамка окна
-  text(bx + 2, by + 1, pad(title, bw - 4 - CROSS_W), C.gold, C.dlg)
+  text(bx + 2, by + 1, pad(title, bw - 6 - CROSS_W), C.gold, C.dlg)
   drawCross(bx, by, bw)
   for i, l in ipairs(lines) do text(bx + 2, by + 2 + i, l, C.text, C.dlg) end
   text(bx + 2, by + bh - 1, pad("Коснитесь экрана, чтобы закрыть", bw - 4), C.dim, C.dlg)
