@@ -2062,10 +2062,31 @@ local function missingCli()
   print("Полный список: /home/kitshop/missing.txt")
 end
 
+-- диагностика: lua shop.lua methods
+-- печатает методы me_interface и pim с описанием (чтобы увидеть, какой отпечаток принимает exportItem)
+local function methodsCli()
+  for _, c in ipairs({ { "me_interface", me }, { "pim", pim } }) do
+    print("=== " .. c[1] .. " ===")
+    local ok, m = pcall(component.methods, c[2].address)
+    if ok and type(m) == "table" then
+      local names = {}
+      for n in pairs(m) do names[#names + 1] = n end
+      table.sort(names)
+      for _, n in ipairs(names) do
+        local okd, doc = pcall(component.doc, c[2].address, n)
+        print(n .. (okd and doc and ("  --  " .. tostring(doc)) or ""))
+      end
+    else
+      print("не удалось получить список методов")
+    end
+  end
+end
+
 if ARGS[1] == "owner" then ownerCli()
 elseif ARGS[1] == "autostart" then autostartCli()
 elseif ARGS[1] == "missing" then missingCli()
 elseif ARGS[1] == "dump" then dumpCli()
+elseif ARGS[1] == "methods" then methodsCli()
 elseif ARGS[1] == "debug" then            -- без автоперезапуска, Ctrl+Alt+C работает
   local ok, err = xpcall(main, debug.traceback)
   if not ok then print(err) end
