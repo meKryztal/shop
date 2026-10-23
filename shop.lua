@@ -490,20 +490,26 @@ local function card(y, title, sub, subColor, reserve)
   text(3, y + CARD_SUB_DY, pad(sub, tw), subColor or C.dim, C.panel)
 end
 
--- карточка комплекта в списке: название по центру, ниже в одну строку по центру
--- «Цена» и «В наличии» с промежутком KIT_GAP колонок между ними
+-- карточка в одну строку: НАЗВАНИЕ (заглавными, accent) + KIT_GAP колонок + информация.
+-- Строка стоит по центру полоски по вертикали (средняя из трёх) и по горизонтали
+-- в области слева от кнопок (reserve - сколько колонок справа занято кнопками).
 local KIT_GAP = 10
-local function kitCard(y, title, left, right, inStock)
-  local cw = W - 2
-  fill(2, y, cw, 3, C.panel)
-  title = tostring(title)
-  local maxT = math.max(1, cw - 2 * (BW + 2))      -- симметрично, чтобы не заехать под кнопку справа
-  if unicode.len(title) > maxT then title = unicode.sub(title, 1, maxT) end
-  text(2 + math.floor((cw - unicode.len(title)) / 2), y + CARD_TITLE_DY, title, C.accent, C.panel)
-  local ll, rl = unicode.len(left), unicode.len(right)
-  local x0 = 2 + math.floor((cw - (ll + KIT_GAP + rl)) / 2)
-  text(x0, y + CARD_SUB_DY, left, C.text, C.panel)
-  text(x0 + ll + KIT_GAP, y + CARD_SUB_DY, right, inStock and C.text or C.red, C.panel)
+local function lineCard(y, title, info, infoColor, reserve)
+  reserve = reserve or (BW + 2)
+  fill(2, y, W - 2, 3, C.panel)
+  local rw = math.max(10, W - reserve - 1)             -- ширина области: колонки 2 .. rw+1
+  title, info = unicode.upper(tostring(title)), tostring(info)
+  local li = unicode.len(info)
+  local room = rw - 2 - KIT_GAP - li
+  if room < 6 then                                      -- не влезает: режем информацию
+    info = unicode.sub(info, 1, math.max(1, rw - 2 - KIT_GAP - 6)); li = unicode.len(info)
+    room = 6
+  end
+  if unicode.len(title) > room then title = unicode.sub(title, 1, room) end
+  local lt = unicode.len(title)
+  local x0 = 2 + math.floor((rw - (lt + KIT_GAP + li)) / 2)
+  text(x0, y + 1, title, C.accent, C.panel)
+  text(x0 + lt + KIT_GAP, y + 1, info, infoColor or C.text, C.panel)
 end
 
 ----------------------------------------------------------------------
@@ -1149,8 +1155,8 @@ local function screenKits()
     local k = list[i]
     local y = LIST_Y + (i - first) * 4
     local stock = kitStock(k, avail)
-    kitCard(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY,
-            "В наличии: " .. stock .. " шт", stock > 0)
+    lineCard(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY .. "   Ресурсов: " .. #k.items ..
+                        "   В наличии: " .. stock .. " шт", stock > 0 and C.text or C.red)
     rb(y, 0, BW, stock > 0 and "Перейти" or "Нет в наличии",
       { disabled = stock <= 0, bg = C.tabOn, fn = function() nav({ view = "kit", kitId = k.id }) end })
   end
@@ -1171,8 +1177,8 @@ local function screenTopup()
     local e = list[i]
     local y = LIST_Y + (i - first) * 4
     local have = (S.inv or {})[itemKey(e.name, e.damage)] or 0
-    card(y, e.label .. "  -  " .. fmt(e.price) .. " " .. CONFIG.CURRENCY .. " за шт",
-         "У вас в инвентаре: " .. have .. " шт", have > 0 and C.text or C.dim, reserve)
+    lineCard(y, e.label, "Цена: " .. fmt(e.price) .. " " .. CONFIG.CURRENCY .. " за шт   У вас в инвентаре: " .. have .. " шт",
+             have > 0 and C.text or C.dim, reserve)
     local off = rb(y, 0, BW, "Ввести число", { disabled = have <= 0, fn = function()
       local n = askNumber("Сколько «" .. e.label .. "» внести?", "", true)
       if n and n > 0 then doDeposit(e, n) else render() end
@@ -1348,8 +1354,8 @@ local function screenCreate()
     for i = first, last do
       local k = db.kits[i]
       local y = SUB_Y + (i - first) * 4
-      card(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY .. "   Ресурсов: " .. #k.items ..
-                      "   Склад: " .. kitStock(k, avail) .. " шт")
+      lineCard(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY .. "   Ресурсов: " .. #k.items ..
+                          "   Склад: " .. kitStock(k, avail) .. " шт")
       rb(y, 0, BW, "Изменить", { bg = C.tabOn, fn = function() nav({ view = "edit", kitId = k.id }) end })
     end
 
@@ -1362,7 +1368,7 @@ local function screenCreate()
     for i = first, last do
       local e = db.topup[i]
       local y = SUB_Y + (i - first) * 4
-      card(y, e.label, "Цена за 1 шт: " .. fmt(e.price) .. " " .. CONFIG.CURRENCY, nil, reserve)
+      lineCard(y, e.label, "Цена за 1 шт: " .. fmt(e.price) .. " " .. CONFIG.CURRENCY, C.text, reserve)
       local off = rb(y, 0, BW2, "Убрать", { fn = function() table.remove(db.topup, i); saveDB(); render() end })
       rb(y, off, BW2, "Цена", { fn = function()
         local v = askNumber("Новая цена за 1 шт «" .. e.label .. "»:", fmt(e.price), false)
