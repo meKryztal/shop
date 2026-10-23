@@ -508,6 +508,51 @@ local function slotQty(s, name, damage)
   return 0
 end
 
+-- Список для выбора предметов из ИНВЕНТАРЯ игрока на PIM (тот же формат, что у pickerScan):
+-- { name, damage, label, qty_в_инвентаре, maxSize, var }
+local function invPickerScan(filter)
+  cache.items = {}
+  return pcall(function()
+    local words = {}
+    for w in searchNorm(filter or ""):gmatch("%S+") do words[#words + 1] = w end
+
+    local out, seen = {}, {}
+    for s = 1, 36 do
+      local ok, st = pcall(pim.getStackInSlot, s)
+      if ok and st then
+        local name, dmg, qty, mx = stackInfo(st)
+        if name then
+          local label = ruName(name, dmg, tostring(st.display_name or st.label or st.rawName or name))
+          local match = true
+          if #words > 0 then
+            local hay = searchNorm(label .. " " .. tostring(name))
+            for _, w in ipairs(words) do
+              if not hay:find(w, 1, true) then match = false; break end
+            end
+          end
+          if match then
+            local k = itemKey(name, dmg, "")
+            local e = seen[k]
+            if e then
+              e[4] = e[4] + qty
+            else
+              e = { name, dmg, label, qty, mx, "" }
+              seen[k] = e
+              out[#out + 1] = e
+            end
+          end
+        end
+      end
+    end
+    table.sort(out, function(a, b)
+      if a[3] ~= b[3] then return a[3] < b[3] end
+      if a[1] ~= b[1] then return a[1] < b[1] end
+      return a[2] < b[2]
+    end)
+    cache.items, cache.pickTotal, cache.pickMore = out, #out, false
+  end)
+end
+
 ----------------------------------------------------------------------
 -- ЭКРАН: примитивы и сетка
 --
@@ -916,7 +961,8 @@ local function doRefresh()
   status("Сканирую ME-сеть...")
   local ok, err = scanME()
   if ok and S.player and S.player.owner and S.view == "pick" then
-    ok, err = pickerScan(S.filter)
+    if S.pickSource == "inv" then ok, err = invPickerScan(S.filter)
+    else ok, err = pickerScan(S.filter) end
   end
   if ok then flash("Список обновлён.", true)
   else
@@ -926,15 +972,16 @@ local function doRefresh()
   end
 end
 
--- открыть окно выбора предмета из ME (только владелец)
-local function openPicker(mode)
-  status("Загружаю список ME...")
-  local ok, err = pickerScan("")
-  if ok then
-    nav({ view = "pick", pickMode = mode, filter = "" })
-  else
-    nav({ view = "pick", pickMode = mode, filter = "" }, "Не удалось получить список ME: " .. tostring(err), false)
-  end
+-- открыть окно выбора предмета (только владелец).
+-- source: "me" - из ME-сети (по умолчанию), "inv" - из инвентаря игрока на PIM
+local function openPicker(mode, source)
+  source = source or "me"
+  status(source == "inv" and "Читаю инвентарь..." or "Загружаю список ME...")
+  local ok, err
+  if source == "inv" then ok, err = invPickerScan("") else ok, err = pickerScan("") end
+  local f = { view = "pick", pickMode = mode, pickSource = source, filter = "" }
+  if ok then nav(f)
+  else nav(f, "Не удалось получить список: " .. tostring(err), false) end
 end
 
 local feedbackLast = {}
@@ -1314,7 +1361,7 @@ end
 local function screenKitEdit()
   local kit = findKit(S.kitId)
   if not kit then S.view = "list"; return false end
-  local n, gap = 4, 1
+  local n, gap = 5, 1
   local bw = math.floor(((W - 2) - gap * (n - 1)) / n)
   local function bx(i) return 2 + (i - 1) * (bw + gap) end
   local lastW = (W - 1) - bx(n) + 1
@@ -1329,8 +1376,9 @@ local function screenKitEdit()
     if v then kit.price = round2(v); saveDB() end
     render()
   end })
-  addBtn(bx(3), 6, bw, 3, "+ Ресурс", { bg = C.tabOn, fn = function() openPicker("kit") end })
-  addBtn(bx(4), 6, lastW, 3, armed and "Точно удалить?" or "Удалить комплект",
+  addBtn(bx(3), 6, bw, 3, "+ Ресурс (ME)", { bg = C.tabOn, fn = function() openPicker("kit", "me") end })
+  addBtn(bx(4), 6, bw, 3, "+ Из инвентаря", { bg = C.blue, fn = function() openPicker("kit", "inv") end })
+  addBtn(bx(5), 6, lastW, 3, armed and "Точно удалить?" or "Удалить комплект",
     { bg = armed and C.red or C.panel2, fn = function()
       if S.confirm == "del" .. kit.id then
         local _, idx = findKit(kit.id)
@@ -1343,7 +1391,7 @@ local function screenKitEdit()
        "   Склад: " .. kitStock(kit, availFn()) .. " шт", W - 2), C.accent, C.bg)
   local y0 = LIST_Y + 1
   local first, last = paged(#kit.items, y0)
-  if #kit.items == 0 then text(2, y0, "Пусто. Нажмите «+ Ресурс», чтобы выбрать предмет из ME.", C.dim, C.bg) end
+  if #kit.items == 0 then text(2, y0, "Пусто. Нажмите «+ Ресурс (ME)» или «+ Из инвентаря», чтобы добавить предмет.", C.dim, C.bg) end
   local reserve = BW2 * 2 + 1 + 2
   for i = first, last do
     local it = kit.items[i]
@@ -1365,10 +1413,15 @@ local function screenKitEdit()
   return true
 end
 
--- e = { name, damage, label, size, maxSize }
+-- e = { name, damage, label, size, maxSize, var }
 local function pickItem(e)
   local name, dmg, label, size, mx, var = e[1], e[2], e[3], e[4], e[5], e[6] or ""
   local k = itemKey(name, dmg, var)
+  if S.pickSource == "inv" then
+    -- size в списке - это количество у игрока на руках, а остаток в ME берём отдельно
+    size = meCount(name, dmg, var) or 0
+    if cache.byKey[k] then cache.byKey[k].size = size end
+  end
   if not cache.byKey[k] then
     cache.byKey[k] = { key = k, name = name, damage = dmg, var = var, label = label, size = size, maxSize = mx }
   end
@@ -1399,9 +1452,11 @@ end
 
 local function applyPickFilter(f)
   S.filter = f; S.page = 1
-  status("Ищу в ME...")
-  local ok, err = pickerScan(S.filter)
-  if not ok then return flash("Не удалось получить список ME: " .. tostring(err), false) end
+  status(S.pickSource == "inv" and "Ищу в инвентаре..." or "Ищу в ME...")
+  local ok, err
+  if S.pickSource == "inv" then ok, err = invPickerScan(S.filter)
+  else ok, err = pickerScan(S.filter) end
+  if not ok then return flash("Не удалось получить список: " .. tostring(err), false) end
   render()
 end
 
@@ -1412,21 +1467,24 @@ local function screenPick()
     if f then applyPickFilter(trim(f)) else render() end
   end })
   addBtn(48, 6, 16, 3, "Сбросить", { disabled = not hasFilter, fn = function() applyPickFilter("") end })
+  local fromInv = (S.pickSource == "inv")
   local info = "Найдено: " .. cache.pickTotal .. (cache.pickMore and ("  (показаны первые " .. #cache.items .. ", уточните поиск)") or "")
   text(66, 6, pad(info, W - 66), C.dim, C.bg)
-  text(66, 8, pad("Данные ME: " .. ageText(), W - 66), C.dim, C.bg)
+  text(66, 8, pad(fromInv and "Источник: ваш инвентарь (кол-во - у вас на руках)"
+                  or ("Данные ME: " .. ageText()), W - 66), C.dim, C.bg)
 
   local list = cache.items
   local first, last = paged(#list, LIST_Y)
   if #list == 0 then
     if hasFilter then text(2, LIST_Y, "Ничего не найдено.", C.dim, C.bg)
+    elseif fromInv then text(2, LIST_Y, "В инвентаре нет предметов.", C.red, C.bg)
     else text(2, LIST_Y, "Список ME пуст или недоступен. Нажмите «Обновить» внизу.", C.red, C.bg) end
   end
   for i = first, last do
     local e = list[i]
     local y = LIST_Y + (i - first) * 4
     -- одна строка, как у остальных карточек
-    lineCard(y, e[3] .. "   [" .. e[1] .. ":" .. e[2] .. "]", "В ME: " .. e[4], C.text)
+    lineCard(y, e[3] .. "   [" .. e[1] .. ":" .. e[2] .. "]", (fromInv and "У вас: " or "В ME: ") .. e[4], C.text)
     rb(y, 0, BW, "Выбрать", { bg = C.tabOn, fn = function() pickItem(e) end })
   end
   S.backFn = function()
@@ -1465,8 +1523,9 @@ local function screenCreate()
     end
 
   elseif S.csub == "topup" then
-    addBtn(2, 10, 28, 3, "+ Добавить ресурс", { bg = C.tabOn, fn = function() openPicker("topup") end })
-    text(32, 11, "Что игрок может сдать, чтобы пополнить баланс.", C.dim, C.bg)
+    addBtn(2, 10, 28, 3, "+ Добавить ресурс", { bg = C.tabOn, fn = function() openPicker("topup", "me") end })
+    addBtn(30, 10, 28, 3, "+ Из инвентаря", { bg = C.blue, fn = function() openPicker("topup", "inv") end })
+    text(60, 11, "Что игрок может сдать, чтобы пополнить баланс.", C.dim, C.bg)
     local first, last = paged(#db.topup, SUB_Y)
     if #db.topup == 0 then text(2, SUB_Y, "Ресурсов пополнения пока нет.", C.dim, C.bg) end
     local reserve = BW2 * 2 + 1 + 2
