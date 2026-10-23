@@ -392,7 +392,7 @@ local function meList(fname, fdmg)
   else ok, base = pcall(me.getItemsInNetwork) end
   if not ok then return tostring(base) end
   if type(base) ~= "table" then return base end
-  if type(me.getAvailableItems) ~= "function" then return base end
+  if me.getAvailableItems == nil then return base end
   local ok2, raw = pcall(me.getAvailableItems)
   if not ok2 or type(raw) ~= "table" then return base end
 
@@ -409,7 +409,7 @@ local function meList(fname, fdmg)
       local d = detailCache[f.nbt_hash]
       if d == nil then
         local ok3, det = pcall(me.getItemDetail, f)
-        if ok3 and type(det) == "table" and type(det.all) == "function" then
+        if ok3 and type(det) == "table" and det.all ~= nil then
           local ok4, all = pcall(det.all); if ok4 then det = all end
         end
         d = (ok3 and type(det) == "table") and det or false
@@ -983,7 +983,7 @@ local function meFingerprint(name, dmg, var)
   var = var or ""
   local fp = { id = name, dmg = dmg }
   if var:sub(1, 1) == "#" then fp.nbt_hash = var:sub(2); return fp end
-  if var == "" or type(me.getAvailableItems) ~= "function" then return fp end
+  if var == "" or me.getAvailableItems == nil then return fp end
   local ok, list = pcall(me.getAvailableItems)
   if not ok or type(list) ~= "table" then return fp end
   local want = lower(var)
@@ -992,7 +992,7 @@ local function meFingerprint(name, dmg, var)
     if type(f) == "table" and f.id == name and math.floor(tonumber(f.dmg) or 0) == dmg and f.nbt_hash then
       local ok2, d = pcall(me.getItemDetail, f)
       if ok2 and type(d) == "table" then
-        if type(d.all) == "function" then
+        if d.all ~= nil then
           local ok3, all = pcall(d.all); if ok3 then d = all end
         end
         local fl = lower(fluidVariant(d))
@@ -2155,7 +2155,7 @@ local function methodsCli()
   if #names == 0 then for k, v in pairs(me) do if type(v) == "function" then names[#names + 1] = k end end end
   table.sort(names)
   print("Методы me_interface: " .. table.concat(names, ", "))
-  if type(me.getAvailableItems) == "function" then
+  if me.getAvailableItems ~= nil then
     local ok2, list = pcall(me.getAvailableItems)
     local n = 0
     if ok2 and type(list) == "table" then
@@ -2163,7 +2163,7 @@ local function methodsCli()
         local f = e.fingerprint
         if type(f) == "table" and tostring(f.id):lower():find("tank", 1, true) then
           local d = me.getItemDetail(f)
-          if type(d) == "table" and type(d.all) == "function" then d = d.all() end
+          if type(d) == "table" and d.all ~= nil then d = d.all() end
           print(tostring(f.id), tostring(f.dmg), tostring(f.nbt_hash), "fluid=" .. fluidVariant(d or {}))
           n = n + 1; if n >= 15 then break end
         end
