@@ -18,9 +18,6 @@ local fs        = require("filesystem")
 local ser       = require("serialization")
 local unicode   = require("unicode")
 
--- в песочнице OpenComputers collectgarbage может отсутствовать: подменяем заглушкой
-local collectgarbage = collectgarbage or function() return 0 end
-
 local ARGS = { ... }               -- аргументы командной строки
 local SELF_SRC = debug.getinfo(1, "S").source   -- откуда загружен файл (нужно для автозапуска)
 
@@ -131,16 +128,15 @@ local function nbtOf(it)
   return nil
 end
 
--- Вариант предмета (ME-стек или стек из PIM):
---   1) по таблице fluid - тип жидкости (без количества): "Water";
---   2) иначе по NBT-хешу: "#<хеш>" (разные баки/капсулы/чары с одним id+damage);
---   3) иначе "" (обычный предмет).
-local function variantOf(it)
+-- Тип жидкости в предмете (только для отображения, без количества): "chocolatemilk".
+-- Ищем в it.fluid (ME) и в it.fluid_container.contents (PIM).
+local function fluidVariant(it)
   local f = type(it) == "table" and it.fluid
   if type(f) ~= "table" then
-    local h = nbtOf(it)
-    return h and ("#" .. h) or ""
+    local fc = type(it) == "table" and it.fluid_container
+    f = type(fc) == "table" and fc.contents or nil
   end
+  if type(f) ~= "table" then return "" end
   local nm = f.name or f.fluid or f.fluidName or f.fluid_name or f.id or f.label or f.localizedName
   if nm ~= nil and type(nm) ~= "table" then return tostring(nm) end
   local parts = {}
@@ -155,10 +151,22 @@ local function variantOf(it)
   return table.concat(parts, ";")
 end
 
+-- Вариант предмета (ME-стек или стек из PIM):
+--   1) NBT-хеш "#<хеш>" - точный (нужен для exportItem, у баков с жидкостью он свой);
+--   2) если хеша нет - тип жидкости;
+--   3) иначе "" (обычный предмет).
+local function variantOf(it)
+  local h = nbtOf(it)
+  if h then return "#" .. h end
+  return fluidVariant(it)
+end
+
 local function labelOf(it, var)
   local l = ruName(it.name, it.damage, tostring(it.label or it.name))
   if var and var ~= "" then
-    l = l .. " (" .. ((var:sub(1, 1) == "#") and var:sub(1, 7) or var) .. ")"
+    local fl = fluidVariant(it)
+    local tag = (fl ~= "") and fl or ((var:sub(1, 1) == "#") and var:sub(1, 7) or var)
+    l = l .. " (" .. tag .. ")"
   end
   return l
 end
@@ -222,23 +230,6 @@ local function loadDB()
       local t = ser.unserialize(data)
       if type(t) == "table" then
         for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
-        -- чиним старые/битые записи: любое пустое поле-список должно быть таблицей,
-        -- иначе ipairs(nil) даёт "bad argument #1 to 'for iterator' (table expected, got nil)"
-        local function tbl(x) return type(x) == "table" and x or {} end
-        for _, key in ipairs({ "owners", "ownerUids", "kits", "topup", "players", "feedback" }) do
-          t[key] = tbl(t[key])
-        end
-        for _, k in ipairs(t.kits) do
-          k.items = tbl(k.items)
-          for _, it in ipairs(k.items) do it.qty = tonumber(it.qty) or 0 end
-        end
-        for _, p in pairs(t.players) do
-          p.purchases = tbl(p.purchases)
-          for _, pu in ipairs(p.purchases) do
-            pu.items = tbl(pu.items)
-            for _, it in ipairs(pu.items) do it.qty = tonumber(it.qty) or 0 end
-          end
-        end
         return t
       end
       -- файл повреждён: не затираем, а откладываем в сторону
@@ -366,46 +357,50 @@ local function wantedNames()
   return w
 end
 
--- Перебор списка из ME: без лишних замыканий (экономит память), пропускает нетабличные
--- записи и периодически чистит мусор, чтобы не упереться в "out of memory".
-local function meEach(list)
-  local i, n = 0, #list
-  return function()
-    while i < n do
-      i = i + 1
-      if i % 200 == 0 then collectgarbage() end
-      local it = list[i]
-      if type(it) == "table" then return i, it end
+-- Миграция старых записей: var был названием жидкости ("chocolatemilk"), теперь это NBT-хеш "#...".
+local function migrateVariants(by)
+  local changed = false
+  local function fix(x)
+    local v = x.var or ""
+    if v ~= "" and v:sub(1, 1) ~= "#" then
+      for _, e in pairs(by) do
+        if e.name == x.name and e.damage == x.damage and e.fluid == v and e.var:sub(1, 1) == "#" then
+          x.var = e.var; changed = true; break
+        end
+      end
     end
   end
+  for _, k in ipairs(db.kits) do for _, it in ipairs(k.items) do fix(it) end end
+  for _, t in ipairs(db.topup) do fix(t) end
+  for _, p in pairs(db.players) do
+    for _, pu in ipairs(p.purchases or {}) do for _, it in ipairs(pu.items) do fix(it) end end
+  end
+  if changed then saveDB() end
 end
 
 -- Лёгкий скан при входе: запоминаем остатки только нужных предметов.
 local function scanME()
   return pcall(function()
+    local list = me.getItemsInNetwork()
+    if type(list) ~= "table" then error("ME вернула " .. type(list)) end
     local want, by = wantedNames(), {}
-    -- запрашиваем у ME только нужные предметы по одному, а не весь склад целиком
-    for wname in pairs(want) do
-      local list = me.getItemsInNetwork({ name = wname })
-      if type(list) ~= "table" then error("ME вернула " .. type(list)) end
-      for _, it in meEach(list) do
-        local name = it.name
-        if name == wname then
-          local dmg = math.floor(tonumber(it.damage) or 0)
-          local size = tonumber(it.size) or 0
-          local var = variantOf(it)
-          local k = itemKey(name, dmg, var)
-          local e = by[k]
-          if e then e.size = e.size + size
-          else
-            by[k] = { key = k, name = name, damage = dmg, var = var, label = labelOf(it, var),
-                      size = size, maxSize = tonumber(it.maxSize) or 64 }
-          end
+    for _, it in ipairs(list) do
+      local name = type(it) == "table" and it.name
+      if name and want[name] then
+        local dmg = math.floor(tonumber(it.damage) or 0)
+        local size = tonumber(it.size) or 0
+        local var = variantOf(it)
+        local k = itemKey(name, dmg, var)
+        local e = by[k]
+        if e then e.size = e.size + size
+        else
+          by[k] = { key = k, name = name, damage = dmg, var = var, fluid = fluidVariant(it),
+                    label = labelOf(it, var), size = size, maxSize = tonumber(it.maxSize) or 64 }
         end
       end
-      list = nil
     end
-    collectgarbage()
+    list = nil
+    migrateVariants(by)
     cache.byKey, cache.time = by, computer.uptime()
   end)
 end
@@ -427,7 +422,7 @@ local function pickerScan(filter)
     for w in searchNorm(filter or ""):gmatch("%S+") do words[#words + 1] = w end
 
     local out, seen = {}, {}
-    for _, it in meEach(list) do
+    for _, it in pairs(list) do
       local name = type(it) == "table" and it.name
       if name then
         local var = variantOf(it)
@@ -467,7 +462,7 @@ local function meCount(name, damage, var)
   local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
   if not ok or type(list) ~= "table" then return nil end
   local total = 0
-  for _, it in meEach(list) do
+  for _, it in ipairs(list) do
     if it.name == name and math.floor(tonumber(it.damage) or 0) == damage
        and variantOf(it) == (var or "") then
       total = total + (tonumber(it.size) or 0)
@@ -483,7 +478,7 @@ local function meResolve(name, damage, var)
   local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
   if not ok or type(list) ~= "table" then return nil end
   local sizes, order = {}, {}
-  for _, it in meEach(list) do
+  for _, it in ipairs(list) do
     if it.name == name and math.floor(tonumber(it.damage) or 0) == damage then
       local v = variantOf(it)
       if sizes[v] == nil then sizes[v] = 0; order[#order + 1] = v end
@@ -929,100 +924,6 @@ local function doBuy(kit)
       "Оплачено! Заберите ресурсы кнопками «Забрать» (можно по одному, можно позже).", true)
 end
 
--- Ищет в таблице (в т.ч. во вложенных) первое значение по одному из ключей
-local function deepFind(t, keys, depth)
-  if type(t) ~= "table" or (depth or 0) > 4 then return nil end
-  for _, k in ipairs(keys) do
-    local v = t[k]
-    if v ~= nil and type(v) ~= "table" and type(v) ~= "function" and tostring(v) ~= "" then return v end
-  end
-  for k, v in pairs(t) do
-    if type(v) == "table" then
-      local r = deepFind(v, keys, (depth or 0) + 1)
-      if r ~= nil then return r end
-    end
-  end
-end
-
--- таблица жидкости внутри произвольной структуры
-local function findFluidTable(t, d)
-  if type(t) ~= "table" or d > 4 then return nil end
-  if type(t.fluid) == "table" then return t.fluid end
-  for _, v in pairs(t) do
-    if type(v) == "table" then
-      local r = findFluidTable(v, d + 1)
-      if r then return r end
-    end
-  end
-end
-
--- жидкость в баке по его хешу: сначала из самой записи, иначе спрашиваем getItemDetail
-local hashVar = {}
-local function variantByHash(name, damage, hash, entry)
-  local hk = name .. "&&" .. damage .. "&&" .. hash
-  if hashVar[hk] ~= nil then return hashVar[hk] end
-  local ft = findFluidTable(entry, 0)
-  if not ft then
-    local ok, d = pcall(me.getItemDetail, { id = name, dmg = damage, nbt_hash = hash })
-    if ok and type(d) == "table" then
-      if type(d.all) == "function" then
-        local ok2, a = pcall(d.all, d); if ok2 then d = a end
-      end
-      ft = findFluidTable(d, 0)
-    end
-  end
-  local v = ft and variantOf({ fluid = ft }) or ""
-  hashVar[hk] = v
-  return v
-end
-
--- getAvailableItems в разных сборках возвращает таблицу только в некоторых режимах: пробуем все
-local function getAvail()
-  for _, mode in ipairs({ "ALL", "PROXY", "NONE", false }) do
-    local ok, r
-    if mode then ok, r = pcall(me.getAvailableItems, mode) else ok, r = pcall(me.getAvailableItems) end
-    if ok and type(r) == "table" then return r, mode end
-  end
-end
-
--- NBT-хеш конкретного варианта. getItemsInNetwork хеш не отдаёт, поэтому перебираем
--- getAvailableItems("ALL") и для каждой записи узнаём жидкость по хешу. Результат кэшируем.
-local hashCache = {}
-local function findNbtHash(name, damage, var)
-  local ck = itemKey(name, damage, var)
-  if hashCache[ck] then return hashCache[ck] end
-  local list = getAvail()
-  if not list then return nil end
-  local found
-  for _, e in pairs(list) do
-    if type(e) == "table" then
-      local id  = deepFind(e, { "id", "name" })
-      local dmg = tonumber(deepFind(e, { "dmg", "damage" })) or 0
-      if id == name and math.floor(dmg) == damage then
-        local h = deepFind(e, { "nbt_hash", "nbtHash" })
-        if h then
-          h = tostring(h)
-          if variantByHash(name, damage, h, e) == var then found = h; break end
-        end
-      end
-    end
-  end
-  if found then hashCache[ck] = found end
-  return found
-end
-
--- Отпечаток для me.exportItem: принимает только id, dmg и nbt_hash.
-local function exportFingerprint(it)
-  local fp = { id = it.name, dmg = it.damage }
-  if it.var and it.var:sub(1, 1) == "#" then
-    fp.nbt_hash = it.var:sub(2)
-  elseif it.var and it.var ~= "" then
-    local h = findNbtHash(it.name, it.damage, it.var)
-    if h then fp.nbt_hash = h end
-  end
-  return fp
-end
-
 local function doClaim(pu, it)
   if it.qty <= 0 then return end
   local key = itemKey(it.name, it.damage, it.var)
@@ -1048,7 +949,8 @@ local function doClaim(pu, it)
   saveDB()
 
   status("Выдаю...")
-  local fp, left = exportFingerprint(it), deliver
+  local fp, left = { id = it.name, dmg = it.damage }, deliver
+  if it.var and it.var:sub(1, 1) == "#" then fp.nbt_hash = it.var:sub(2) end   -- точный вариант (NBT)
   while left > 0 do
     local chunk = math.min(left, maxSize)
     local ok, res = pcall(me.exportItem, fp, CONFIG.ME_EXPORT_SIDE, chunk)
@@ -2075,21 +1977,14 @@ local function ownerCli()
   end
 end
 
--- диагностика: lua kitshop.lua dump [часть названия | fluid]
+-- диагностика: lua kitshop.lua dump [часть названия]
 -- печатает все поля первых 10 подходящих предметов из ME (чтобы найти поле NBT/хеша)
 local function dumpCli()
   local f = lower(ARGS[2] or "")
   local list = me.getItemsInNetwork()
   local shown = 0
-  for _, it in meEach(list) do
-    local hit
-    if f == "fluid" then
-      -- режим «fluid»: показать предметы, у которых есть жидкость или NBT-хеш
-      hit = type(it) == "table" and (type(it.fluid) == "table" or nbtOf(it) ~= nil or it.hasTag == true)
-    else
-      hit = (f == "" or lower(tostring(it.label) .. " " .. tostring(it.name)):find(f, 1, true))
-    end
-    if hit then
+  for _, it in ipairs(list) do
+    if f == "" or lower(tostring(it.label) .. " " .. tostring(it.name)):find(f, 1, true) then
       local parts = {}
       for k, v in pairs(it) do
         if type(v) == "table" then
@@ -2130,7 +2025,7 @@ local function missingCli()
   local list = me.getItemsInNetwork()
   local seen, rows = {}, {}
   local total, translated = 0, 0
-  for _, it in meEach(list) do
+  for _, it in ipairs(list) do
     if type(it) == "table" and it.name then
       local dmg = math.floor(tonumber(it.damage) or 0)
       local k = tostring(it.name) .. "&&" .. dmg
@@ -2163,87 +2058,10 @@ local function missingCli()
   print("Полный список: /home/kitshop/missing.txt")
 end
 
--- диагностика: lua shop.lua methods
--- печатает методы me_interface и pim с описанием (чтобы увидеть, какой отпечаток принимает exportItem)
-local function methodsCli()
-  for _, c in ipairs({ { "me_interface", me }, { "pim", pim } }) do
-    print("=== " .. c[1] .. " ===")
-    local ok, m = pcall(component.methods, c[2].address)
-    if ok and type(m) == "table" then
-      local names = {}
-      for n in pairs(m) do names[#names + 1] = n end
-      table.sort(names)
-      for _, n in ipairs(names) do
-        local okd, doc = pcall(component.doc, c[2].address, n)
-        print(n .. (okd and doc and ("  --  " .. tostring(doc)) or ""))
-      end
-    else
-      print("не удалось получить список методов")
-    end
-  end
-end
-
--- диагностика: lua shop.lua avail [часть названия]
--- печатает сырые записи me.getAvailableItems("ALL"): видно, где лежит nbt_hash
-local function avail_dump(v, ind, depth)
-  if type(v) ~= "table" then return tostring(v) end
-  if depth > 3 then return "{...}" end
-  local parts = {}
-  for k, x in pairs(v) do
-    parts[#parts + 1] = tostring(k) .. "=" .. (type(x) == "function" and "<function>" or avail_dump(x, ind, depth + 1))
-  end
-  table.sort(parts)
-  return "{" .. table.concat(parts, ", ") .. "}"
-end
-local function availCli()
-  local f = lower(ARGS[2] or "tank")
-  -- каждый вызов getAvailableItems возвращает огромную таблицу: проверяем по одному
-  -- и сразу отпускаем результат, иначе не хватает памяти
-  for _, mode in ipairs({ "ALL", "PROXY", "NONE" }) do
-    local ok, r = pcall(me.getAvailableItems, mode)
-    print("getAvailableItems(" .. mode .. "): ok=" .. tostring(ok) .. " тип=" .. type(r) ..
-          (type(r) ~= "table" and (" значение=" .. tostring(r):sub(1, 200)) or ""))
-    r = nil
-    collectgarbage()
-  end
-  do
-    local ok0, r0 = pcall(me.getAvailableItems)
-    print("getAvailableItems(): ok=" .. tostring(ok0) .. " тип=" .. type(r0))
-    r0 = nil
-    collectgarbage()
-  end
-
-  local list, mode = getAvail()
-  if not list then print("Ни один вариант не вернул таблицу."); return end
-  print("Использую режим: " .. tostring(mode))
-  local shown, n = 0, 0
-  for _, e in pairs(list) do
-    n = n + 1
-    if n % 50 == 0 then collectgarbage() end
-    local line = avail_dump(e, "", 0)
-    if lower(line):find(f, 1, true) then
-      print(line:sub(1, 700))
-      local h = deepFind(e, { "nbt_hash", "nbtHash" })
-      local id = deepFind(e, { "id", "name" })
-      local dm = tonumber(deepFind(e, { "dmg", "damage" })) or 0
-      if h and id then
-        local okd, d = pcall(me.getItemDetail, { id = id, dmg = dm, nbt_hash = tostring(h) })
-        print("  getItemDetail: " .. (okd and avail_dump(d, "", 0):sub(1, 500) or tostring(d)))
-      end
-      print("")
-      shown = shown + 1
-      if shown >= 4 then break end
-    end
-  end
-  if shown == 0 then print("Ничего не найдено") end
-end
-
 if ARGS[1] == "owner" then ownerCli()
 elseif ARGS[1] == "autostart" then autostartCli()
 elseif ARGS[1] == "missing" then missingCli()
 elseif ARGS[1] == "dump" then dumpCli()
-elseif ARGS[1] == "methods" then methodsCli()
-elseif ARGS[1] == "avail" then availCli()
 elseif ARGS[1] == "debug" then            -- без автоперезапуска, Ctrl+Alt+C работает
   local ok, err = xpcall(main, debug.traceback)
   if not ok then print(err) end
