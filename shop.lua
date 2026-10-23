@@ -891,6 +891,37 @@ local function doBuy(kit)
       "Оплачено! Заберите ресурсы кнопками «Забрать» (можно по одному, можно позже).", true)
 end
 
+-- Сырой стек из ME, соответствующий варианту (нужен, чтобы взять его NBT-хеш / отпечаток).
+local function meRawStack(name, damage, var)
+  local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
+  if not ok or type(list) ~= "table" then return nil end
+  local fallback
+  for _, it in ipairs(list) do
+    if type(it) == "table" and it.name == name and math.floor(tonumber(it.damage) or 0) == damage then
+      local v = variantOf(it)
+      if v == (var or "") then return it end
+      if not fallback and sameVariant(v, var or "") then fallback = it end
+    end
+  end
+  return fallback
+end
+
+-- Отпечаток для me.exportItem. Для баков с жидкостью вариант = название жидкости, а не хеш,
+-- поэтому хеш берём из самого ME-стека - иначе ME отдаёт ПЕРВЫЙ попавшийся (пустой) бак.
+local function exportFingerprint(it)
+  local fp = { id = it.name, dmg = it.damage }
+  if it.var and it.var:sub(1, 1) == "#" then fp.nbt_hash = it.var:sub(2) end
+  local raw = meRawStack(it.name, it.damage, it.var)
+  if raw then
+    local h = nbtOf(raw)
+    if h then fp.nbt_hash = h end
+    if type(raw.fingerprint) == "table" then
+      for k, v in pairs(raw.fingerprint) do fp[k] = v end
+    end
+  end
+  return fp
+end
+
 local function doClaim(pu, it)
   if it.qty <= 0 then return end
   local key = itemKey(it.name, it.damage, it.var)
@@ -916,8 +947,7 @@ local function doClaim(pu, it)
   saveDB()
 
   status("Выдаю...")
-  local fp, left = { id = it.name, dmg = it.damage }, deliver
-  if it.var and it.var:sub(1, 1) == "#" then fp.nbt_hash = it.var:sub(2) end   -- точный вариант (NBT)
+  local fp, left = exportFingerprint(it), deliver
   while left > 0 do
     local chunk = math.min(left, maxSize)
     local ok, res = pcall(me.exportItem, fp, CONFIG.ME_EXPORT_SIDE, chunk)
@@ -1944,14 +1974,21 @@ local function ownerCli()
   end
 end
 
--- диагностика: lua kitshop.lua dump [часть названия]
+-- диагностика: lua kitshop.lua dump [часть названия | fluid]
 -- печатает все поля первых 10 подходящих предметов из ME (чтобы найти поле NBT/хеша)
 local function dumpCli()
   local f = lower(ARGS[2] or "")
   local list = me.getItemsInNetwork()
   local shown = 0
   for _, it in ipairs(list) do
-    if f == "" or lower(tostring(it.label) .. " " .. tostring(it.name)):find(f, 1, true) then
+    local hit
+    if f == "fluid" then
+      -- режим «fluid»: показать предметы, у которых есть жидкость или NBT-хеш
+      hit = type(it) == "table" and (type(it.fluid) == "table" or nbtOf(it) ~= nil or it.hasTag == true)
+    else
+      hit = (f == "" or lower(tostring(it.label) .. " " .. tostring(it.name)):find(f, 1, true))
+    end
+    if hit then
       local parts = {}
       for k, v in pairs(it) do
         if type(v) == "table" then
