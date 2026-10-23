@@ -20,6 +20,9 @@ local unicode   = require("unicode")
 
 local ARGS = { ... }               -- аргументы командной строки
 
+-- Оригинальные обработчики прерывания запоминаем ОДИН раз (до возможных перезапусков main)
+local ORIG_INT, ORIG_SOFT = event.shouldInterrupt, event.shouldSoftInterrupt
+
 ----------------------------------------------------------------------
 -- НАСТРОЙКИ
 ----------------------------------------------------------------------
@@ -435,7 +438,7 @@ local UI = { btns = {}, tag = nil, oy = 0 }   -- oy: сдвиг по Y для с
 local CONTENT_OY = 1                          -- на сколько строк содержимое ниже базовой сетки
 
 local LIST_Y = 10       -- начало списка карточек на обычных экранах
-local SUB_Y  = 13       -- начало списка на вкладке «Создание»
+local SUB_Y  = 14       -- начало списка на вкладке «Создание»
 local BW     = 18       -- стандартная ширина кнопки в карточке
 local BW2    = 14       -- ширина кнопок, когда их две в ряд
 
@@ -490,15 +493,15 @@ local function card(y, title, sub, subColor, reserve)
   text(3, y + CARD_SUB_DY, pad(sub, tw), subColor or C.dim, C.panel)
 end
 
--- карточка в одну строку: НАЗВАНИЕ (заглавными, accent) + KIT_GAP колонок + информация.
--- Строка стоит по центру полоски по вертикали (средняя из трёх) и по горизонтали
--- в области слева от кнопок (reserve - сколько колонок справа занято кнопками).
+-- карточка в одну строку: Название (accent) + KIT_GAP колонок + информация.
+-- Строка прижата к левому краю карточки и стоит по центру полоски по вертикали
+-- (средняя из трёх). reserve - сколько колонок справа занято кнопками.
 local KIT_GAP = 10
 local function lineCard(y, title, info, infoColor, reserve)
   reserve = reserve or (BW + 2)
   fill(2, y, W - 2, 3, C.panel)
   local rw = math.max(10, W - reserve - 1)             -- ширина области: колонки 2 .. rw+1
-  title, info = unicode.upper(tostring(title)), tostring(info)
+  title, info = tostring(title), tostring(info)
   local li = unicode.len(info)
   local room = rw - 2 - KIT_GAP - li
   if room < 6 then                                      -- не влезает: режем информацию
@@ -507,7 +510,7 @@ local function lineCard(y, title, info, infoColor, reserve)
   end
   if unicode.len(title) > room then title = unicode.sub(title, 1, room) end
   local lt = unicode.len(title)
-  local x0 = 2 + math.floor((rw - (lt + KIT_GAP + li)) / 2)
+  local x0 = 3                                          -- левый край (как у остальных карточек)
   text(x0, y + 1, title, C.accent, C.panel)
   text(x0 + lt + KIT_GAP, y + 1, info, infoColor or C.text, C.panel)
 end
@@ -813,7 +816,11 @@ local function doRefresh()
     ok, err = pickerScan(S.filter)
   end
   if ok then flash("Список обновлён.", true)
-  else flash("Не удалось просканировать ME: " .. tostring(err), false) end
+  else
+    -- технический текст ошибки видит только владелец
+    flash("Не удалось просканировать ME." ..
+          ((S.player and S.player.owner) and (" " .. tostring(err)) or ""), false)
+  end
 end
 
 -- открыть окно выбора предмета из ME (только владелец)
@@ -1239,8 +1246,8 @@ local function screenKitEdit()
     local it = kit.items[i]
     local y = y0 + (i - first) * 4
     local c = cache.byKey[itemKey(it.name, it.damage)]
-    card(y, it.label .. "   x" .. it.qty, "В ME: " .. (c and c.size or 0) .. "   " .. it.name .. ":" .. it.damage,
-         nil, reserve)
+    card(y, it.label .. "   [" .. it.name .. ":" .. it.damage .. "]   x" .. it.qty,
+         "В ME: " .. (c and c.size or 0), nil, reserve)
     local off = rb(y, 0, BW2, "Убрать", { fn = function()
       table.remove(kit.items, i); saveDB(); render()
     end })
@@ -1264,7 +1271,7 @@ local function pickItem(e)
   if S.pickMode == "kit" then
     local kit = findKit(S.kitId)
     if not kit then return nav({ view = "list" }) end
-    local q = askNumber("Сколько «" .. label .. "» в комплекте?", "1", true)
+    local q = askNumber("Сколько «" .. label .. "» [" .. name .. ":" .. dmg .. "] в комплекте?", "1", true)
     if not q or q < 1 then return render() end
     local found = false
     for _, it in ipairs(kit.items) do
@@ -1274,7 +1281,7 @@ local function pickItem(e)
     saveDB()
     flash("Добавлено: " .. label .. " x" .. q .. ". Выберите ещё или нажмите «Назад».", true)
   else
-    local price = askNumber("Цена за 1 шт «" .. label .. "» (" .. CONFIG.CURRENCY .. "):", "1", false)
+    local price = askNumber("Цена за 1 шт «" .. label .. "» [" .. name .. ":" .. dmg .. "] (" .. CONFIG.CURRENCY .. "):", "1", false)
     if not price then return render() end
     local found = false
     for _, t in ipairs(db.topup) do
@@ -1314,7 +1321,7 @@ local function screenPick()
   for i = first, last do
     local e = list[i]
     local y = LIST_Y + (i - first) * 4
-    card(y, e[3], "В ME: " .. e[4] .. "   " .. e[1] .. ":" .. e[2])
+    card(y, e[3] .. "   [" .. e[1] .. ":" .. e[2] .. "]", "В ME: " .. e[4])
     rb(y, 0, BW, "Выбрать", { bg = C.tabOn, fn = function() pickItem(e) end })
   end
   S.backFn = function()
@@ -1331,7 +1338,7 @@ local function screenCreate()
   subBar()
 
   if S.csub == "kits" then
-    addBtn(2, 9, 28, 3, "+ Новый комплект", { bg = C.tabOn, fn = function()
+    addBtn(2, 10, 28, 3, "+ Новый комплект", { bg = C.tabOn, fn = function()
       local nm = prompt("Название нового комплекта:", "", 40)
       if nm and trim(nm) ~= "" then
         local kit = { id = db.nextKitId, name = trim(nm), price = 0, items = {} }
@@ -1353,15 +1360,16 @@ local function screenCreate()
     end
 
   elseif S.csub == "topup" then
-    addBtn(2, 9, 28, 3, "+ Добавить ресурс", { bg = C.tabOn, fn = function() openPicker("topup") end })
-    text(32, 10, "Что игрок может сдать, чтобы пополнить баланс.", C.dim, C.bg)
+    addBtn(2, 10, 28, 3, "+ Добавить ресурс", { bg = C.tabOn, fn = function() openPicker("topup") end })
+    text(32, 11, "Что игрок может сдать, чтобы пополнить баланс.", C.dim, C.bg)
     local first, last = paged(#db.topup, SUB_Y)
     if #db.topup == 0 then text(2, SUB_Y, "Ресурсов пополнения пока нет.", C.dim, C.bg) end
     local reserve = BW2 * 2 + 1 + 2
     for i = first, last do
       local e = db.topup[i]
       local y = SUB_Y + (i - first) * 4
-      lineCard(y, e.label, "Цена за 1 шт: " .. fmt(e.price) .. " " .. CONFIG.CURRENCY, C.text, reserve)
+      lineCard(y, e.label .. " [" .. e.name .. ":" .. e.damage .. "]",
+               "Цена за 1 шт: " .. fmt(e.price) .. " " .. CONFIG.CURRENCY, C.text, reserve)
       local off = rb(y, 0, BW2, "Убрать", { fn = function() table.remove(db.topup, i); saveDB(); render() end })
       rb(y, off, BW2, "Цена", { fn = function()
         local v = askNumber("Новая цена за 1 шт «" .. e.label .. "»:", fmt(e.price), false)
@@ -1372,12 +1380,12 @@ local function screenCreate()
 
   else -- отзывы
     local armed = (S.confirm == "clearfb")
-    addBtn(2, 9, 28, 3, armed and "Точно очистить?" or "Очистить все", { disabled = #db.feedback == 0,
+    addBtn(2, 10, 28, 3, armed and "Точно очистить?" or "Очистить все", { disabled = #db.feedback == 0,
       bg = armed and C.red or C.panel2, fn = function()
         if S.confirm == "clearfb" then db.feedback = {}; saveDB(); nav({ csub = "feedback", view = "list" }, "Отзывы очищены.", true)
         else S.confirm = "clearfb"; render() end
       end })
-    text(32, 10, "Сообщения игроков и автоматические отчёты об ошибках.", C.dim, C.bg)
+    text(32, 11, "Сообщения игроков и автоматические отчёты об ошибках.", C.dim, C.bg)
     local n = #db.feedback
     local first, last = paged(n, SUB_Y)
     if n == 0 then text(2, SUB_Y, "Отзывов пока нет.", C.dim, C.bg) end
@@ -1451,7 +1459,9 @@ local function onPlayerOn(e)
   purgePurchases(p)
   local ok, err = scanME()                 -- единственное "тяжёлое" сканирование на входе
   render()
-  if not ok then flash("ME недоступна: " .. tostring(err), false)
+  if not ok then
+    -- технический текст ошибки видит только владелец
+    flash("ME недоступна." .. (S.player.owner and (" " .. tostring(err)) or ""), false)
   elseif pendingCount(p) > 0 then
     flash("У вас есть незабранные ресурсы - кнопка «Незабранное» вверху справа.", true)
   elseif S.player.owner and unreadFeedback() > 0 then
@@ -1512,7 +1522,7 @@ local function main()
   W, H = gpu.getResolution()
 
   -- защита киоска: Ctrl+Alt+C с клавиатуры игрока не должен останавливать программу
-  local origInterrupt, origSoft = event.shouldInterrupt, event.shouldSoftInterrupt
+  -- (оригинальные обработчики сохранены в ORIG_INT / ORIG_SOFT один раз, при загрузке файла)
   if ARGS[1] ~= "debug" then
     event.shouldInterrupt = function() return false end
     event.shouldSoftInterrupt = function() return false end
@@ -1544,7 +1554,7 @@ local function main()
     if pendingOff then pendingOff = false; pcall(onPlayerOff) end
   end
 
-  event.shouldInterrupt, event.shouldSoftInterrupt = origInterrupt, origSoft
+  event.shouldInterrupt, event.shouldSoftInterrupt = ORIG_INT, ORIG_SOFT
   gpu.setBackground(0x000000); gpu.setForeground(0xFFFFFF)
   gpu.fill(1, 1, W, H, " ")
   print("KitShop остановлен.")
