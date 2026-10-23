@@ -363,17 +363,16 @@ local function wantedNames()
   return w
 end
 
--- Безопасный перебор списка из ME: не падает на битых/нетабличных записях
--- (ошибка "bad argument #N for iterator"), пропускает их.
+-- Перебор списка из ME: без лишних замыканий (экономит память), пропускает нетабличные
+-- записи и периодически чистит мусор, чтобы не упереться в "out of memory".
 local function meEach(list)
-  local i, n = 0, 0
-  local okn, len = pcall(function() return #list end)
-  n = okn and len or 0
+  local i, n = 0, #list
   return function()
     while i < n do
       i = i + 1
-      local ok, it = pcall(function() return list[i] end)
-      if ok and type(it) == "table" then return i, it end
+      if i % 200 == 0 then collectgarbage() end
+      local it = list[i]
+      if type(it) == "table" then return i, it end
     end
   end
 end
@@ -381,25 +380,29 @@ end
 -- Лёгкий скан при входе: запоминаем остатки только нужных предметов.
 local function scanME()
   return pcall(function()
-    local list = me.getItemsInNetwork()
-    if type(list) ~= "table" then error("ME вернула " .. type(list)) end
     local want, by = wantedNames(), {}
-    for _, it in meEach(list) do
-      local name = type(it) == "table" and it.name
-      if name and want[name] then
-        local dmg = math.floor(tonumber(it.damage) or 0)
-        local size = tonumber(it.size) or 0
-        local var = variantOf(it)
-        local k = itemKey(name, dmg, var)
-        local e = by[k]
-        if e then e.size = e.size + size
-        else
-          by[k] = { key = k, name = name, damage = dmg, var = var, label = labelOf(it, var),
-                    size = size, maxSize = tonumber(it.maxSize) or 64 }
+    -- запрашиваем у ME только нужные предметы по одному, а не весь склад целиком
+    for wname in pairs(want) do
+      local list = me.getItemsInNetwork({ name = wname })
+      if type(list) ~= "table" then error("ME вернула " .. type(list)) end
+      for _, it in meEach(list) do
+        local name = it.name
+        if name == wname then
+          local dmg = math.floor(tonumber(it.damage) or 0)
+          local size = tonumber(it.size) or 0
+          local var = variantOf(it)
+          local k = itemKey(name, dmg, var)
+          local e = by[k]
+          if e then e.size = e.size + size
+          else
+            by[k] = { key = k, name = name, damage = dmg, var = var, label = labelOf(it, var),
+                      size = size, maxSize = tonumber(it.maxSize) or 64 }
+          end
         end
       end
+      list = nil
     end
-    list = nil
+    collectgarbage()
     cache.byKey, cache.time = by, computer.uptime()
   end)
 end
