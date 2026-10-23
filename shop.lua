@@ -425,12 +425,17 @@ local function meList(fname, fdmg)
     end
   end
   -- если NBT-предметы через getAvailableItems не нашлись, лучше вернуть всё как есть
+  raw = nil                                -- освобождаем самый большой список до дальнейшей работы
   if tagged == 0 then
-    local clean = {}
-    for _, it in ipairs(base) do
-      if type(it) == "table" and not it.hasTag then clean[#clean + 1] = it end
+    -- NBT-предметы без хеша нельзя выдавать как обычные (выйдет пустой бак).
+    -- Фильтруем base НА МЕСТЕ, без копии - иначе на большой сети не хватает RAM.
+    local n = 0
+    for i = 1, #base do
+      local it = base[i]
+      base[i] = nil
+      if type(it) == "table" and not it.hasTag then n = n + 1; base[n] = it end
     end
-    return clean
+    return base
   end
   return out
 end
