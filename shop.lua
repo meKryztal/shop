@@ -906,8 +906,40 @@ local function deepFind(t, keys, depth)
   end
 end
 
--- NBT-хеш конкретного варианта. getItemsInNetwork хеш не отдаёт, поэтому спрашиваем
--- getAvailableItems("ALL"), где у каждой позиции есть отпечаток. Результат кэшируем.
+-- таблица жидкости внутри произвольной структуры
+local function findFluidTable(t, d)
+  if type(t) ~= "table" or d > 4 then return nil end
+  if type(t.fluid) == "table" then return t.fluid end
+  for _, v in pairs(t) do
+    if type(v) == "table" then
+      local r = findFluidTable(v, d + 1)
+      if r then return r end
+    end
+  end
+end
+
+-- жидкость в баке по его хешу: сначала из самой записи, иначе спрашиваем getItemDetail
+local hashVar = {}
+local function variantByHash(name, damage, hash, entry)
+  local hk = name .. "&&" .. damage .. "&&" .. hash
+  if hashVar[hk] ~= nil then return hashVar[hk] end
+  local ft = findFluidTable(entry, 0)
+  if not ft then
+    local ok, d = pcall(me.getItemDetail, { id = name, dmg = damage, nbt_hash = hash })
+    if ok and type(d) == "table" then
+      if type(d.all) == "function" then
+        local ok2, a = pcall(d.all, d); if ok2 then d = a end
+      end
+      ft = findFluidTable(d, 0)
+    end
+  end
+  local v = ft and variantOf({ fluid = ft }) or ""
+  hashVar[hk] = v
+  return v
+end
+
+-- NBT-хеш конкретного варианта. getItemsInNetwork хеш не отдаёт, поэтому перебираем
+-- getAvailableItems("ALL") и для каждой записи узнаём жидкость по хешу. Результат кэшируем.
 local hashCache = {}
 local function findNbtHash(name, damage, var)
   local ck = itemKey(name, damage, var)
@@ -923,16 +955,11 @@ local function findNbtHash(name, damage, var)
       local id  = deepFind(e, { "id", "name" })
       local dmg = tonumber(deepFind(e, { "dmg", "damage" })) or 0
       if id == name and math.floor(dmg) == damage then
-        local ftab
-        local function findFluidTable(t, d)
-          if type(t) ~= "table" or d > 4 then return end
-          if type(t.fluid) == "table" then ftab = ftab or t.fluid; return end
-          for _, v in pairs(t) do if type(v) == "table" then findFluidTable(v, d + 1) end end
-        end
-        findFluidTable(e, 0)
-        local v = ftab and variantOf({ fluid = ftab }) or ""
         local h = deepFind(e, { "nbt_hash", "nbtHash" })
-        if h and (v == var or (v == "" and var == "")) then found = tostring(h); break end
+        if h then
+          h = tostring(h)
+          if variantByHash(name, damage, h, e) == var then found = h; break end
+        end
       end
     end
   end
@@ -2132,7 +2159,15 @@ local function availCli()
   for _, e in pairs(list) do
     local line = avail_dump(e, "", 0)
     if lower(line):find(f, 1, true) then
-      print(line:sub(1, 700)); print("")
+      print(line:sub(1, 700))
+      local h = deepFind(e, { "nbt_hash", "nbtHash" })
+      local id = deepFind(e, { "id", "name" })
+      local dm = tonumber(deepFind(e, { "dmg", "damage" })) or 0
+      if h and id then
+        local okd, d = pcall(me.getItemDetail, { id = id, dmg = dm, nbt_hash = tostring(h) })
+        print("  getItemDetail: " .. (okd and avail_dump(d, "", 0):sub(1, 500) or tostring(d)))
+      end
+      print("")
       shown = shown + 1
       if shown >= 4 then break end
     end
