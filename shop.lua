@@ -602,22 +602,24 @@ local function safePull(fn, ...)
   end
 end
 
-----------------------------------------------------------------------
--- ВВОД С КЛАВИАТУРЫ + МОДАЛЬНОЕ ОКНО
-----------------------------------------------------------------------
--- Крестик «закрыть» в правом верхнем углу окна. Esc в игре закрывает сам GUI
--- экрана и до программы не доходит, поэтому отмена делается касанием крестика.
-local CROSS_W, CROSS_H = 5, 3
+-- Крестик «закрыть» внутри окна, в строке заголовка (справа, с отступом от рамки).
+-- Esc в игре закрывает сам GUI экрана и до программы не доходит, поэтому отмена
+-- делается касанием крестика.
+local CROSS_W, CROSS_H = 3, 1
+local function crossPos(bx, by, bw)
+  return bx + bw - CROSS_W - 2, by + 1     -- внутри рамки: 1 колонка отступа от правой границы
+end
 local function drawCross(bx, by, bw)
-  local x = bx + bw - CROSS_W
-  fill(x, by, CROSS_W, CROSS_H, 0x8a2222)
-  text(x + math.floor(CROSS_W / 2), by + 1, "×", 0xffffff, 0x8a2222)
+  local x, y = crossPos(bx, by, bw)
+  fill(x, y, CROSS_W, CROSS_H, 0x8a2222)
+  text(x + math.floor(CROSS_W / 2), y, "×", 0xffffff, 0x8a2222)
 end
 local function hitCross(e, bx, by, bw)
   local x, y = e[3], e[4]
   if type(x) ~= "number" or type(y) ~= "number" then return false end
-  return x >= bx + bw - CROSS_W and x <= bx + bw - 1
-     and y >= by + UI.oy and y <= by + UI.oy + CROSS_H - 1
+  local cx, cy = crossPos(bx, by, bw)
+  return x >= cx and x <= cx + CROSS_W - 1
+     and y == cy + UI.oy
 end
 
 local function prompt(title, initial, maxLen)
