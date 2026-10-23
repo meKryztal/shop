@@ -910,6 +910,16 @@ local function askNumber(title, initial, integer)
   return n
 end
 
+-- цена: строго больше нуля
+local function askPrice(title, initial)
+  local v = askNumber(title, initial, false)
+  if v and round2(v) <= 0 then
+    flash("Цена не может быть 0. Укажите значение больше нуля.", false)
+    return nil
+  end
+  return v
+end
+
 local function modal(title, body)
   local bw = math.min(W - 4, 100)
   local lines = wrap(body, bw - 4)
@@ -954,6 +964,7 @@ end
 local function doBuy(kit)
   local p = getPlayer(S.player.name)
   if #kit.items == 0 then return flash("Комплект пуст.", false) end
+  if round2(kit.price) <= 0 then return flash("Цена комплекта не задана.", false) end
   if round2(p.balance) < round2(kit.price) then
     return flash("Не хватает средств: нужно " .. fmt(kit.price) .. ", на балансе " .. fmt(p.balance) ..
                  ". Загляните во вкладку «Пополнение».", false)
@@ -1009,6 +1020,8 @@ local function meFingerprint(name, dmg, var)
 end
 
 local function doClaim(pu, it)
+  -- в сообщениях хеш не показываем
+  local shown = tostring(it.label):gsub("%s*#[%w_%-]+", ""):gsub("%s*%(%s*%)", "")
   if it.qty <= 0 then return end
   local key = itemKey(it.name, it.damage, it.var)
   local maxSize = (cache.byKey[key] and cache.byKey[key].maxSize) or 64
@@ -1026,7 +1039,7 @@ local function doClaim(pu, it)
   end
 
   local fp, fpErr = meFingerprint(it.name, it.damage, it.var)
-  if not fp then return flash("Не могу выдать «" .. it.label .. "»: " .. tostring(fpErr), false) end
+  if not fp then return flash("Не могу выдать «" .. shown .. "»: " .. tostring(fpErr), false) end
   local deliver = math.min(it.qty, space, real)
   local before = countIn(slots, it.name, it.damage, it.var)
 
@@ -1055,17 +1068,13 @@ local function doClaim(pu, it)
 
   if given == 0 then
     local extra = ""
-    if S.player.owner then
-      extra = " [hash=" .. tostring(fp.nbt_hash) .. (lastExportErr and (", " .. lastExportErr:sub(1, 80)) or "") .. "]"
-    end
-    return flash("Не удалось выдать «" .. it.label .. "». Попробуйте ещё раз." .. extra, false)
+    if S.player.owner and lastExportErr then extra = " [" .. lastExportErr:sub(1, 80) .. "]" end
+    return flash("Не удалось выдать «" .. shown .. "». Попробуйте ещё раз." .. extra, false)
   elseif it.qty > 0 then
-    return flash("Выдано " .. given .. " из " .. (given + it.qty) .. " («" .. it.label ..
+    return flash("Выдано " .. given .. " из " .. (given + it.qty) .. " («" .. shown ..
                  "»). Освободите место и нажмите «Забрать» снова.", true)
   end
-  local dbg = ""
-  if S.player.owner then dbg = "  [var=" .. tostring(it.var) .. ", hash=" .. tostring(fp.nbt_hash) .. "]" end
-  flash("Выдано: " .. it.label .. " x" .. given .. dbg, true)
+  flash("Выдано: " .. shown .. " x" .. given, true)
 end
 
 -- Пополнение: pim.pushItem толкает предмет из слота игрока в соседний инвентарь (ME Interface).
@@ -1576,7 +1585,7 @@ local function screenKitEdit()
     render()
   end })
   addBtn(bx(2), 6, bw, 3, "Цена: " .. fmt(kit.price), { fn = function()
-    local v = askNumber("Цена комплекта (" .. CONFIG.CURRENCY .. "):", fmt(kit.price), false)
+    local v = askPrice("Цена комплекта (" .. CONFIG.CURRENCY .. "):", fmt(kit.price))
     if v then kit.price = round2(v); saveDB() end
     render()
   end })
@@ -1654,7 +1663,7 @@ local function pickItem(e)
     saveDB()
     flash("Добавлено: " .. label .. " x" .. q .. ". Выберите ещё или нажмите «Назад».", true)
   else
-    local price = askNumber("Цена за 1 шт «" .. label .. "» [" .. name .. ":" .. dmg .. "] (" .. CONFIG.CURRENCY .. "):", "1", false)
+    local price = askPrice("Цена за 1 шт «" .. label .. "» [" .. name .. ":" .. dmg .. "] (" .. CONFIG.CURRENCY .. "):", "1")
     if not price then return render() end
     local found = false
     for _, t in ipairs(db.topup) do
@@ -1753,7 +1762,7 @@ local function screenCreate()
                function() renameEntry(e) end)
       local off = rb(y, 0, BW2, "Убрать", { fn = function() table.remove(db.topup, i); saveDB(); render() end })
       rb(y, off, BW2, "Цена", { fn = function()
-        local v = askNumber("Новая цена за 1 шт «" .. e.label .. "»:", fmt(e.price), false)
+        local v = askPrice("Новая цена за 1 шт «" .. e.label .. "»:", fmt(e.price))
         if v then e.price = round2(v); saveDB() end
         render()
       end })
