@@ -73,7 +73,36 @@ local function fmt(n)
   if n == math.floor(n) then return string.format("%d", n) end
   return string.format("%.2f", n)
 end
-local function itemKey(name, dmg) return tostring(name) .. "&&" .. tostring(math.floor(tonumber(dmg) or 0)) end
+-- var - «вариант» предмета (например, какая жидкость в баке). Пусто для обычных предметов.
+local function itemKey(name, dmg, var)
+  local k = tostring(name) .. "&&" .. tostring(math.floor(tonumber(dmg) or 0))
+  if var and var ~= "" then k = k .. "&&" .. tostring(var) end
+  return k
+end
+
+-- Вариант предмета из ME: по таблице fluid (тип жидкости, без количества).
+local function variantOf(it)
+  local f = type(it) == "table" and it.fluid
+  if type(f) ~= "table" then return "" end
+  local nm = f.name or f.fluid or f.fluidName or f.fluid_name or f.id or f.label or f.localizedName
+  if nm ~= nil and type(nm) ~= "table" then return tostring(nm) end
+  local parts = {}
+  for k, v in pairs(f) do
+    local ks = lower(k)
+    if type(v) ~= "table" and not ks:find("amount", 1, true) and not ks:find("capacity", 1, true)
+       and not ks:find("size", 1, true) and not ks:find("qty", 1, true) then
+      parts[#parts + 1] = tostring(k) .. "=" .. tostring(v)
+    end
+  end
+  table.sort(parts)
+  return table.concat(parts, ";")
+end
+
+local function labelOf(it, var)
+  local l = tostring(it.label or it.name)
+  if var and var ~= "" then l = l .. " (" .. var .. ")" end
+  return l
+end
 
 -- обрезать/дополнить пробелами до ширины w (учитывает кириллицу)
 local function pad(s, w)
@@ -214,7 +243,7 @@ local function reservedMap()
     for _, pu in ipairs(p.purchases or {}) do
       for _, it in ipairs(pu.items) do
         if it.qty > 0 then
-          local k = itemKey(it.name, it.damage)
+          local k = itemKey(it.name, it.damage, it.var)
           r[k] = (r[k] or 0) + it.qty
         end
       end
@@ -261,11 +290,12 @@ local function scanME()
       if name and want[name] then
         local dmg = math.floor(tonumber(it.damage) or 0)
         local size = tonumber(it.size) or 0
-        local k = itemKey(name, dmg)
+        local var = variantOf(it)
+        local k = itemKey(name, dmg, var)
         local e = by[k]
         if e then e.size = e.size + size
         else
-          by[k] = { key = k, name = name, damage = dmg, label = tostring(it.label or name),
+          by[k] = { key = k, name = name, damage = dmg, var = var, label = labelOf(it, var),
                     size = size, maxSize = tonumber(it.maxSize) or 64 }
         end
       end
@@ -283,20 +313,28 @@ local function pickerScan(filter)
     local list = me.getItemsInNetwork()
     if type(list) ~= "table" then error("ME вернула " .. type(list)) end
     local f = lower(filter or "")
-    local out, total = {}, 0
+    local out, seen = {}, {}
     for _, it in ipairs(list) do
       local name = type(it) == "table" and it.name
       if name then
-        local label = tostring(it.label or name)
+        local var = variantOf(it)
+        local label = labelOf(it, var)
         if f == "" or lower(label .. " " .. name):find(f, 1, true) then
-          total = total + 1
-          if #out < CONFIG.PICK_MAX then
-            out[#out + 1] = { name, math.floor(tonumber(it.damage) or 0), label,
-                              tonumber(it.size) or 0, tonumber(it.maxSize) or 64 }
+          local dmg = math.floor(tonumber(it.damage) or 0)
+          local k = itemKey(name, dmg, var)
+          local e = seen[k]
+          if e then
+            e[4] = e[4] + (tonumber(it.size) or 0)
+          else
+            e = { name, dmg, label, tonumber(it.size) or 0, tonumber(it.maxSize) or 64, var }
+            seen[k] = e
+            out[#out + 1] = e
           end
         end
       end
     end
+    local total = #out
+    for i = #out, CONFIG.PICK_MAX + 1, -1 do out[i] = nil end
     list = nil
     table.sort(out, function(a, b)
       if a[3] ~= b[3] then return a[3] < b[3] end
@@ -308,12 +346,13 @@ local function pickerScan(filter)
 end
 
 -- точный запрос по одному предмету (дёшево, используется при покупке/выдаче)
-local function meCount(name, damage)
+local function meCount(name, damage, var)
   local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
   if not ok or type(list) ~= "table" then return nil end
   local total = 0
   for _, it in ipairs(list) do
-    if it.name == name and math.floor(tonumber(it.damage) or 0) == damage then
+    if it.name == name and math.floor(tonumber(it.damage) or 0) == damage
+       and variantOf(it) == (var or "") then
       total = total + (tonumber(it.size) or 0)
     end
   end
@@ -332,7 +371,7 @@ local function kitStock(kit, avail)
   if #kit.items == 0 then return 0 end
   local m = math.huge
   for _, it in ipairs(kit.items) do
-    m = math.min(m, math.floor(avail(itemKey(it.name, it.damage)) / it.qty))
+    m = math.min(m, math.floor(avail(itemKey(it.name, it.damage, it.var)) / it.qty))
   end
   return m
 end
@@ -662,9 +701,9 @@ end
 local function verifyStock(kit)
   local res = reservedMap()
   for _, it in ipairs(kit.items) do
-    local real = meCount(it.name, it.damage)
+    local real = meCount(it.name, it.damage, it.var)
     if real == nil then return false, "ME-сеть недоступна. Попробуйте позже." end
-    local k = itemKey(it.name, it.damage)
+    local k = itemKey(it.name, it.damage, it.var)
     if cache.byKey[k] then cache.byKey[k].size = real end
     if real - (res[k] or 0) < it.qty then
       return false, "Комплект только что закончился: не хватает «" .. it.label .. "»."
@@ -688,7 +727,7 @@ local function doBuy(kit)
   local pu = { id = db.nextPurchaseId, kit = kit.name, items = {} }
   db.nextPurchaseId = db.nextPurchaseId + 1
   for _, it in ipairs(kit.items) do
-    pu.items[#pu.items + 1] = { name = it.name, damage = it.damage, label = it.label, qty = it.qty }
+    pu.items[#pu.items + 1] = { name = it.name, damage = it.damage, var = it.var, label = it.label, qty = it.qty }
   end
   p.purchases[#p.purchases + 1] = pu
   saveDB()
@@ -698,7 +737,7 @@ end
 
 local function doClaim(pu, it)
   if it.qty <= 0 then return end
-  local key = itemKey(it.name, it.damage)
+  local key = itemKey(it.name, it.damage, it.var)
   local maxSize = (cache.byKey[key] and cache.byKey[key].maxSize) or 64
 
   status("Проверяю место в инвентаре...")
@@ -707,7 +746,7 @@ local function doClaim(pu, it)
   if space <= 0 then
     return flash("Нет места в инвентаре. Освободите слот и нажмите «Забрать» ещё раз.", false)
   end
-  local real = meCount(it.name, it.damage)
+  local real = meCount(it.name, it.damage, it.var)
   if real == nil then return flash("ME-сеть недоступна. Попробуйте позже.", false) end
   if real <= 0 then
     return flash("Ресурса сейчас нет в ME. Напишите владельцу через «Обратная связь».", false)
@@ -815,7 +854,7 @@ local function doDeposit(e, amount)
   local p = getPlayer(S.player.name)
   local gain = round2(moved * e.price)
   p.balance = round2(p.balance + gain)
-  local c = cache.byKey[itemKey(e.name, e.damage)]
+  local c = cache.byKey[itemKey(e.name, e.damage, e.var)]
   if c then c.size = c.size + moved end
   saveDB()
   flash("Принято " .. moved .. " шт. «" .. e.label .. "». Зачислено: " .. fmt(gain) .. " " .. CONFIG.CURRENCY, true)
@@ -1101,7 +1140,7 @@ local function screenKitView()
   for i = first, last do
     local it = kit.items[i]
     local y = LIST_Y + (i - first) * 4
-    local a = avail(itemKey(it.name, it.damage))
+    local a = avail(itemKey(it.name, it.damage, it.var))
     card(y, it.label .. "   x" .. it.qty, "В наличии: " .. a .. (a >= it.qty and "" or "   (не хватает)"),
          a >= it.qty and C.dim or C.red, 0)
   end
@@ -1258,7 +1297,7 @@ local function screenKitEdit()
   for i = first, last do
     local it = kit.items[i]
     local y = y0 + (i - first) * 4
-    local c = cache.byKey[itemKey(it.name, it.damage)]
+    local c = cache.byKey[itemKey(it.name, it.damage, it.var)]
     -- одна строка, как у остальных карточек
     lineCard(y, it.label .. "   [" .. it.name .. ":" .. it.damage .. "]",
              "x" .. it.qty .. "   В ME: " .. (c and c.size or 0), C.text, reserve)
@@ -1277,10 +1316,10 @@ end
 
 -- e = { name, damage, label, size, maxSize }
 local function pickItem(e)
-  local name, dmg, label, size, mx = e[1], e[2], e[3], e[4], e[5]
-  local k = itemKey(name, dmg)
+  local name, dmg, label, size, mx, var = e[1], e[2], e[3], e[4], e[5], e[6] or ""
+  local k = itemKey(name, dmg, var)
   if not cache.byKey[k] then
-    cache.byKey[k] = { key = k, name = name, damage = dmg, label = label, size = size, maxSize = mx }
+    cache.byKey[k] = { key = k, name = name, damage = dmg, var = var, label = label, size = size, maxSize = mx }
   end
   if S.pickMode == "kit" then
     local kit = findKit(S.kitId)
@@ -1289,9 +1328,9 @@ local function pickItem(e)
     if not q or q < 1 then return render() end
     local found = false
     for _, it in ipairs(kit.items) do
-      if it.name == name and it.damage == dmg then it.qty = it.qty + q; found = true end
+      if it.name == name and it.damage == dmg and (it.var or "") == var then it.qty = it.qty + q; found = true end
     end
-    if not found then kit.items[#kit.items + 1] = { name = name, damage = dmg, label = label, qty = q } end
+    if not found then kit.items[#kit.items + 1] = { name = name, damage = dmg, var = var, label = label, qty = q } end
     saveDB()
     flash("Добавлено: " .. label .. " x" .. q .. ". Выберите ещё или нажмите «Назад».", true)
   else
@@ -1299,9 +1338,9 @@ local function pickItem(e)
     if not price then return render() end
     local found = false
     for _, t in ipairs(db.topup) do
-      if t.name == name and t.damage == dmg then t.price = round2(price); found = true end
+      if t.name == name and t.damage == dmg and (t.var or "") == var then t.price = round2(price); found = true end
     end
-    if not found then db.topup[#db.topup + 1] = { name = name, damage = dmg, label = label, price = round2(price) } end
+    if not found then db.topup[#db.topup + 1] = { name = name, damage = dmg, var = var, label = label, price = round2(price) } end
     saveDB()
     flash("Ресурс пополнения сохранён: " .. label .. " по " .. fmt(price), true)
   end
@@ -1606,9 +1645,19 @@ local function dumpCli()
   for _, it in ipairs(list) do
     if f == "" or lower(tostring(it.label) .. " " .. tostring(it.name)):find(f, 1, true) then
       local parts = {}
-      for k, v in pairs(it) do parts[#parts + 1] = tostring(k) .. "=" .. tostring(v) end
+      for k, v in pairs(it) do
+        if type(v) == "table" then
+          local sub = {}
+          for k2, v2 in pairs(v) do sub[#sub + 1] = tostring(k2) .. "=" .. tostring(v2) end
+          table.sort(sub)
+          parts[#parts + 1] = tostring(k) .. "={" .. table.concat(sub, ", ") .. "}"
+        else
+          parts[#parts + 1] = tostring(k) .. "=" .. tostring(v)
+        end
+      end
       table.sort(parts)
       print(table.concat(parts, "  "))
+      print("  -> вариант: [" .. variantOf(it) .. "]")
       shown = shown + 1
       if shown >= 10 then break end
     end
