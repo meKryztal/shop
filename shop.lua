@@ -18,6 +18,9 @@ local fs        = require("filesystem")
 local ser       = require("serialization")
 local unicode   = require("unicode")
 
+-- в песочнице OpenComputers collectgarbage может отсутствовать: подменяем заглушкой
+local collectgarbage = collectgarbage or function() return 0 end
+
 local ARGS = { ... }               -- аргументы командной строки
 local SELF_SRC = debug.getinfo(1, "S").source   -- откуда загружен файл (нужно для автозапуска)
 
@@ -2248,4 +2251,3 @@ else
   pcall(ensureAutostart)
   supervised()
 end
-
