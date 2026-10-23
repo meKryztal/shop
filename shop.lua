@@ -924,6 +924,38 @@ local function doBuy(kit)
       "Оплачено! Заберите ресурсы кнопками «Забрать» (можно по одному, можно позже).", true)
 end
 
+-- Отпечаток предмета для exportItem. Если в записи нет NBT-хеша (ME его не отдаёт, а предмет -
+-- бак с жидкостью), ищем хеш среди предметов сети: перебираем getAvailableItems() с тем же id+dmg
+-- и сравниваем жидкость в getItemDetail() с нужной.
+local lastExportErr
+local function meFingerprint(name, dmg, var)
+  var = var or ""
+  local fp = { id = name, dmg = dmg }
+  if var:sub(1, 1) == "#" then fp.nbt_hash = var:sub(2); return fp end
+  if var == "" or type(me.getAvailableItems) ~= "function" then return fp end
+  local ok, list = pcall(me.getAvailableItems)
+  if not ok or type(list) ~= "table" then return fp end
+  local want = lower(var)
+  for _, e in ipairs(list) do
+    local f = type(e) == "table" and e.fingerprint
+    if type(f) == "table" and f.id == name and math.floor(tonumber(f.dmg) or 0) == dmg and f.nbt_hash then
+      local ok2, d = pcall(me.getItemDetail, f)
+      if ok2 and type(d) == "table" then
+        if type(d.all) == "function" then
+          local ok3, all = pcall(d.all); if ok3 then d = all end
+        end
+        local fl = lower(fluidVariant(d))
+        local fc = type(d) == "table" and d.fluid_container
+        local raw = type(fc) == "table" and type(fc.contents) == "table" and lower(tostring(fc.contents.rawName or "")) or ""
+        if fl == want or raw == want then
+          return { id = f.id, dmg = f.dmg, nbt_hash = f.nbt_hash }
+        end
+      end
+    end
+  end
+  return fp
+end
+
 local function doClaim(pu, it)
   if it.qty <= 0 then return end
   local key = itemKey(it.name, it.damage, it.var)
@@ -949,14 +981,14 @@ local function doClaim(pu, it)
   saveDB()
 
   status("Выдаю...")
-  local fp, left = { id = it.name, dmg = it.damage }, deliver
-  if it.var and it.var:sub(1, 1) == "#" then fp.nbt_hash = it.var:sub(2) end   -- точный вариант (NBT)
+  local fp, left = meFingerprint(it.name, it.damage, it.var), deliver
+  lastExportErr = nil
   while left > 0 do
     local chunk = math.min(left, maxSize)
     local ok, res = pcall(me.exportItem, fp, CONFIG.ME_EXPORT_SIDE, chunk)
-    if not ok then break end
+    if not ok then lastExportErr = tostring(res); break end
     local moved = tonumber(res) or (type(res) == "table" and tonumber(res.size)) or nil
-    if moved == 0 then break end
+    if moved == 0 then lastExportErr = "exportItem вернул 0"; break end
     left = left - chunk
   end
 
@@ -968,7 +1000,11 @@ local function doClaim(pu, it)
   saveDB()
 
   if given == 0 then
-    return flash("Не удалось выдать «" .. it.label .. "». Попробуйте ещё раз.", false)
+    local extra = ""
+    if S.player.owner then
+      extra = " [hash=" .. tostring(fp.nbt_hash) .. (lastExportErr and (", " .. lastExportErr:sub(1, 80)) or "") .. "]"
+    end
+    return flash("Не удалось выдать «" .. it.label .. "». Попробуйте ещё раз." .. extra, false)
   elseif it.qty > 0 then
     return flash("Выдано " .. given .. " из " .. (given + it.qty) .. " («" .. it.label ..
                  "»). Освободите место и нажмите «Забрать» снова.", true)
@@ -2058,7 +2094,33 @@ local function missingCli()
   print("Полный список: /home/kitshop/missing.txt")
 end
 
-if ARGS[1] == "owner" then ownerCli()
+-- диагностика: lua shop.lua methods - список методов ME Interface и пример getAvailableItems
+local function methodsCli()
+  local ok, m = pcall(component.methods, me.address)
+  local names = {}
+  if ok and type(m) == "table" then for k in pairs(m) do names[#names + 1] = k end end
+  if #names == 0 then for k, v in pairs(me) do if type(v) == "function" then names[#names + 1] = k end end end
+  table.sort(names)
+  print("Методы me_interface: " .. table.concat(names, ", "))
+  if type(me.getAvailableItems) == "function" then
+    local ok2, list = pcall(me.getAvailableItems)
+    local n = 0
+    if ok2 and type(list) == "table" then
+      for _, e in ipairs(list) do
+        local f = e.fingerprint
+        if type(f) == "table" and tostring(f.id):lower():find("tank", 1, true) then
+          local d = me.getItemDetail(f)
+          if type(d) == "table" and type(d.all) == "function" then d = d.all() end
+          print(tostring(f.id), tostring(f.dmg), tostring(f.nbt_hash), "fluid=" .. fluidVariant(d or {}))
+          n = n + 1; if n >= 15 then break end
+        end
+      end
+    else print("getAvailableItems: ошибка " .. tostring(list)) end
+  else print("getAvailableItems нет") end
+end
+
+if ARGS[1] == "methods" then methodsCli()
+elseif ARGS[1] == "owner" then ownerCli()
 elseif ARGS[1] == "autostart" then autostartCli()
 elseif ARGS[1] == "missing" then missingCli()
 elseif ARGS[1] == "dump" then dumpCli()
