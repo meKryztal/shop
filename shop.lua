@@ -26,14 +26,15 @@ local ARGS = { ... }               -- аргументы командной ст
 local CONFIG = {
   OWNERS   = {},                    -- необязательно: ники прямо в файле.
                                     -- Основной способ: lua kitshop.lua owner add Ник
-  CURRENCY = "эм",                  -- название валюты на экране
+  CURRENCY = "coin",                  -- название валюты на экране
 
   DB_PATH  = "/home/kitshop/db.dat",
   LOG_PATH = "/home/kitshop/error.log",
 
-  -- Стороны. По умолчанию как в pimmarket: ME Interface стоит ПОД PIM.
+  -- Стороны.
   ME_EXPORT_SIDE = "up",            -- откуда ME Interface выдаёт предметы (в сторону PIM)
-  PIM_PUSH_SIDE  = "down",          -- куда PIM принимает предметы игрока (в ME Interface)
+  PIM_PUSH_SIDE  = "north",         -- сторона для pim.pushItem (если не сработает, код переберёт остальные сам
+                                    -- и запомнит рабочую; впишите её сюда, когда узнаете)
 
   REFRESH_COOLDOWN = 60,            -- кнопка "Обновить" не чаще раза в N секунд
   SCREEN_W = 160, SCREEN_H = 50,     -- желаемое разрешение (подстроится под экран)
@@ -406,12 +407,22 @@ local function invMap(slots)
   return m
 end
 
+-- количество конкретного предмета в одном слоте (nil - ошибка чтения)
+local function slotQty(s, name, damage)
+  local ok, st = pcall(pim.getStackInSlot, s)
+  if not ok then return nil end
+  if not st then return 0 end
+  local n, d, q = stackInfo(st)
+  if n == name and d == damage then return q end
+  return 0
+end
+
 ----------------------------------------------------------------------
 -- ЭКРАН: примитивы и сетка
 --
 --   колонка 1 и колонка W - пустые поля; содержимое занимает 2 .. W-1
---   строки: 1 шапка | 2-3 вкладки | 4 сообщение | 5-6 управление |
---           7 инфо | 8+ список (карточки по 2 строки + 1 пропуск) | H-1..H подвал
+--   строки: 1 шапка | 3-5 вкладки | 6 сообщение | 7+ содержимое (сдвиг UI.oy) |
+--           список карточек по 3 строки + 1 пропуск | H-2..H подвал
 ----------------------------------------------------------------------
 local W, H = 160, 50
 local C = {
@@ -420,23 +431,27 @@ local C = {
   red = 0xff5555, blue = 0x2f5fb3, green = 0x2f7d1a, disabled = 0x262626,
   tabOn = 0x3a7d1e, tabOff = 0x2a2a2a, dlg = 0x202020,
 }
-local UI = { btns = {}, tag = nil }
+local UI = { btns = {}, tag = nil, oy = 0 }   -- oy: сдвиг по Y для содержимого вкладок
+local CONTENT_OY = 1                          -- на сколько строк содержимое ниже базовой сетки
 
 local LIST_Y = 10       -- начало списка карточек на обычных экранах
 local SUB_Y  = 13       -- начало списка на вкладке «Создание»
 local BW     = 18       -- стандартная ширина кнопки в карточке
 local BW2    = 14       -- ширина кнопок, когда их две в ряд
 
+-- положение текста внутри карточки (полоска 3 строки): было 0 и 2
+local CARD_TITLE_DY, CARD_SUB_DY = 0, 1
+
 local function fill(x, y, w, h, bg)
   if w <= 0 or h <= 0 then return end
   gpu.setBackground(bg)
-  gpu.fill(x, y, w, h, " ")
+  gpu.fill(x, y + UI.oy, w, h, " ")
 end
 
 local function text(x, y, s, fg, bg)
   gpu.setBackground(bg or C.bg)
   gpu.setForeground(fg or C.text)
-  gpu.set(x, y, s)
+  gpu.set(x, y + UI.oy, s)
 end
 
 -- текст по центру экрана
@@ -455,7 +470,7 @@ local function addBtn(x, y, w, h, label, o)
   if l > w then label = unicode.sub(label, 1, w); l = w end
   text(x + math.floor((w - l) / 2), y + math.floor((h - 1) / 2), label, fg, bg)
   if not o.disabled and o.fn then
-    UI.btns[#UI.btns + 1] = { x = x, y = y, w = w, h = h, fn = o.fn, tag = UI.tag }
+    UI.btns[#UI.btns + 1] = { x = x, y = y + UI.oy, w = w, h = h, fn = o.fn, tag = UI.tag }
   end
 end
 
@@ -471,8 +486,8 @@ local function card(y, title, sub, subColor, reserve)
   reserve = reserve or (BW + 2)
   local tw = math.max(1, W - reserve - 4)
   fill(2, y, W - 2, 3, C.panel)
-  text(3, y, pad(title, tw), C.accent, C.panel)
-  text(3, y + 2, pad(sub, tw), subColor or C.dim, C.panel)
+  text(3, y + CARD_TITLE_DY, pad(title, tw), C.accent, C.panel)
+  text(3, y + CARD_SUB_DY, pad(sub, tw), subColor or C.dim, C.panel)
 end
 
 ----------------------------------------------------------------------
@@ -483,11 +498,14 @@ local pendingOff = false
 local running = true
 local render, nav, flash, status   -- объявлены заранее
 
+-- сообщение рисуется в собственной строке 6 (без сдвига), содержимое его не затирает
 local function drawMessage()
-  fill(1, 5, W, 1, C.bg)
+  local oy = UI.oy; UI.oy = 0
+  fill(1, 6, W, 1, C.bg)
   if S.msg and S.msg ~= "" then
     text(2, 6, pad(S.msg, W - 2), S.msgOk == false and C.red or C.accent, C.bg)
   end
+  UI.oy = oy
 end
 
 status = function(msg) S.msg = msg; S.msgOk = true; drawMessage() end
@@ -670,6 +688,43 @@ local function doClaim(pu, it)
   flash("Выдано: " .. it.label .. " x" .. given, true)
 end
 
+-- Пополнение: pim.pushItem толкает предмет из слота игрока в соседний инвентарь (ME Interface).
+-- Если сторона из CONFIG не подошла, перебираем остальные и запоминаем ту, через которую
+-- предмет реально ушёл (проверяем по слоту).
+local ALL_SIDES = { "north", "south", "east", "west", "up", "down" }
+local pushSideOk, lastPushErr = nil, nil
+
+-- толкает предмет из слота в ME; возвращает, сколько реально ушло
+local function pushFromSlot(s, take, name, damage)
+  local before = slotQty(s, name, damage)
+  if not before or before <= 0 then return 0 end
+  take = math.min(take, before)
+
+  -- порядок: ранее сработавшая, из CONFIG, потом все остальные
+  local sides, seen = {}, {}
+  local function add(x) if x and not seen[x] then seen[x] = true; sides[#sides + 1] = x end end
+  add(pushSideOk)
+  add(lower(CONFIG.PIM_PUSH_SIDE))
+  for _, x in ipairs(ALL_SIDES) do add(x) end
+
+  for _, side in ipairs(sides) do
+    local variants = (side == side:upper()) and { side } or { side, side:upper() }
+    for _, variant in ipairs(variants) do
+      local ok, res = pcall(pim.pushItem, variant, s, take)
+      if ok then
+        local after = slotQty(s, name, damage)
+        if after and before - after > 0 then
+          pushSideOk = variant      -- запомнили рабочую сторону
+          return before - after
+        end
+      else
+        lastPushErr = tostring(res)
+      end
+    end
+  end
+  return 0
+end
+
 local function doDeposit(e, amount)
   status("Читаю инвентарь...")
   local before = readSlots()
@@ -678,13 +733,13 @@ local function doDeposit(e, amount)
   if want <= 0 then return flash("В инвентаре нет «" .. e.label .. "».", false) end
 
   status("Принимаю ресурсы...")
+  lastPushErr = nil
   local left = want
   for s = 1, 36 do
     if left <= 0 then break end
     local st = before[s]
     if st and st.name == e.name and st.damage == e.damage then
-      local take = math.min(st.qty, left)
-      if pcall(pim.pushItem, CONFIG.PIM_PUSH_SIDE, s, take) then left = left - take end
+      left = left - pushFromSlot(s, math.min(st.qty, left), e.name, e.damage)
     end
   end
 
@@ -692,7 +747,11 @@ local function doDeposit(e, amount)
   local after = countIn(afterSlots, e.name, e.damage)
   local moved = math.max(0, math.min(want, have - after))
   S.inv = invMap(afterSlots)
-  if moved <= 0 then return flash("Не удалось принять предметы (возможно, ME переполнена).", false) end
+  if moved <= 0 then
+    local msg = "Не удалось принять предметы. Проверьте подключение ME Interface к PIM и свободное место в ME."
+    if S.player.owner and lastPushErr then msg = msg .. " [" .. lastPushErr:sub(1, 80) .. "]" end
+    return flash(msg, false)
+  end
 
   local p = getPlayer(S.player.name)
   local gain = round2(moved * e.price)
@@ -745,9 +804,9 @@ end
 ----------------------------------------------------------------------
 -- ЭКРАНЫ
 ----------------------------------------------------------------------
--- сколько карточек влезает: от строки y0 до подвала, шаг 3
+-- сколько карточек влезает: от строки y0 до подвала, шаг 4 (3 строки + пропуск)
 local function paged(count, y0)
-  local per = math.max(1, math.floor((H - 1 - y0) / 4))
+  local per = math.max(1, math.floor((H - 1 - y0 - UI.oy) / 4))
   local pages = math.max(1, math.ceil(count / per))
   if S.page > pages then S.page = pages end
   if S.page < 1 then S.page = 1 end
@@ -763,7 +822,7 @@ local function drawIdle()
   local function ctr(row, s, fg)
     text(bx + math.floor((bw - unicode.len(s)) / 2), by + row, s, fg, C.panel)
   end
-  ctr(3, "КомплектМаркет", C.accent)
+  ctr(3, "КВЕСТЫ", C.accent)
   ctr(6, "Встаньте на PIM", C.text)
 end
 
@@ -776,7 +835,6 @@ end
 
 local function drawHeader()
   fill(1, 1, W, 1, C.bar)
-  text(2, 1, "КомплектМаркет", C.accent, C.bar)
   local bal = "Баланс: " .. fmt(getPlayer(S.player.name).balance) .. " " .. CONFIG.CURRENCY
   local balW = unicode.len(bal)
   text(W - balW, 1, bal, C.gold, C.bar)
@@ -791,7 +849,7 @@ local function drawHeader()
     local on = (S.tab == t[1])
     local x = (i - 1) * tw + 1
     local w = (i == n) and (W - x + 1) or tw
-    addBtn(x, 2, w, 3, t[2],
+    addBtn(x, 3, w, 3, t[2],
       { bg = on and C.tabOn or C.tabOff, fg = on and 0xffffff or C.dim, fn = function() switchTab(t[1]) end })
   end
 end
@@ -1153,6 +1211,7 @@ end
 ----------------------------------------------------------------------
 render = function()
   UI.btns = {}
+  UI.oy = 0
   gpu.setBackground(C.bg)
   gpu.fill(1, 1, W, H, " ")
   if not S.player then return drawIdle() end
@@ -1160,10 +1219,15 @@ render = function()
   S.pages = 1
   drawHeader()
   drawMessage()
-  if S.tab == "kits" then screenKits()
-  elseif S.tab == "topup" then screenTopup()
-  elseif S.tab == "create" and S.player.owner then screenCreate()
-  else S.tab = "kits"; screenKits() end
+  UI.oy = CONTENT_OY
+  local ok, err = pcall(function()
+    if S.tab == "kits" then screenKits()
+    elseif S.tab == "topup" then screenTopup()
+    elseif S.tab == "create" and S.player.owner then screenCreate()
+    else S.tab = "kits"; screenKits() end
+  end)
+  UI.oy = 0
+  if not ok then error(err, 0) end
   drawFooter()
 end
 
@@ -1186,6 +1250,7 @@ local function onPlayerOn(e)
         tab = "kits", view = "list", csub = "kits", page = 1, pages = 1,
         msg = "", msgOk = true, inv = {}, filter = "" }
   UI.btns = {}
+  UI.oy = 0
   cache.items = {}
   gpu.setBackground(C.bg); gpu.fill(1, 1, W, H, " ")
   ctext(math.floor(H / 2), "Здравствуйте, " .. S.player.name .. "!", C.accent, C.bg)
@@ -1224,6 +1289,7 @@ end
 local lastAutoReport = -100
 local function reportError(err)
   err = tostring(err)
+  UI.oy = 0
   local f = io.open(CONFIG.LOG_PATH, "a")
   if f then f:write(tostring(os.time()) .. " " .. err .. "\n"); f:close() end
   local now = computer.uptime()
