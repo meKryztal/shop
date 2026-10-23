@@ -490,6 +490,22 @@ local function card(y, title, sub, subColor, reserve)
   text(3, y + CARD_SUB_DY, pad(sub, tw), subColor or C.dim, C.panel)
 end
 
+-- карточка комплекта в списке: название по центру, ниже в одну строку по центру
+-- «Цена» и «В наличии» с промежутком KIT_GAP колонок между ними
+local KIT_GAP = 10
+local function kitCard(y, title, left, right, inStock)
+  local cw = W - 2
+  fill(2, y, cw, 3, C.panel)
+  title = tostring(title)
+  local maxT = math.max(1, cw - 2 * (BW + 2))      -- симметрично, чтобы не заехать под кнопку справа
+  if unicode.len(title) > maxT then title = unicode.sub(title, 1, maxT) end
+  text(2 + math.floor((cw - unicode.len(title)) / 2), y + CARD_TITLE_DY, title, C.accent, C.panel)
+  local ll, rl = unicode.len(left), unicode.len(right)
+  local x0 = 2 + math.floor((cw - (ll + KIT_GAP + rl)) / 2)
+  text(x0, y + CARD_SUB_DY, left, C.text, C.panel)
+  text(x0 + ll + KIT_GAP, y + CARD_SUB_DY, right, inStock and C.text or C.red, C.panel)
+end
+
 ----------------------------------------------------------------------
 -- СОСТОЯНИЕ
 ----------------------------------------------------------------------
@@ -531,6 +547,21 @@ end
 ----------------------------------------------------------------------
 -- ВВОД С КЛАВИАТУРЫ + МОДАЛЬНОЕ ОКНО
 ----------------------------------------------------------------------
+-- Крестик «закрыть» в правом верхнем углу окна. Esc в игре закрывает сам GUI
+-- экрана и до программы не доходит, поэтому отмена делается касанием крестика.
+local CROSS_W, CROSS_H = 5, 3
+local function drawCross(bx, by, bw)
+  local x = bx + bw - CROSS_W
+  fill(x, by, CROSS_W, CROSS_H, 0x8a2222)
+  text(x + math.floor(CROSS_W / 2), by + 1, "×", 0xffffff, 0x8a2222)
+end
+local function hitCross(e, bx, by, bw)
+  local x, y = e[3], e[4]
+  if type(x) ~= "number" or type(y) ~= "number" then return false end
+  return x >= bx + bw - CROSS_W and x <= bx + bw - 1
+     and y >= by + UI.oy and y <= by + UI.oy + CROSS_H - 1
+end
+
 local function prompt(title, initial, maxLen)
   maxLen = maxLen or 60
   local bw = math.min(W - 4, 80)
@@ -539,19 +570,24 @@ local function prompt(title, initial, maxLen)
   local buf = initial or ""
   local function draw()
     fill(bx, by, bw, bh, C.dlg)
-    text(bx + 2, by + 1, pad(title, bw - 4), C.gold, C.dlg)
+    text(bx + 2, by + 1, pad(title, bw - 4 - CROSS_W), C.gold, C.dlg)
+    drawCross(bx, by, bw)
     fill(bx + 2, by + 3, bw - 4, 1, 0x000000)
     local shown, room = buf, bw - 8
     if unicode.len(shown) > room then shown = unicode.sub(shown, unicode.len(shown) - room + 1) end
     text(bx + 3, by + 3, shown .. "_", C.accent, 0x000000)
-    text(bx + 2, by + 5, pad("Enter - принять, Esc - отмена", bw - 4), C.dim, C.dlg)
+    text(bx + 2, by + 5, pad("Enter - принять,  × - отмена", bw - 4), C.dim, C.dlg)
   end
   draw()
   while true do
-    local e = table.pack(safePull(event.pullMultiple, "key_down", "player_off"))
+    local e = table.pack(safePull(event.pullMultiple, "key_down", "touch", "player_off"))
     if e[1] == "player_off" then pendingOff = true; return nil end
-    local who = e[5]
-    if not who or not S.player or lower(who) == lower(S.player.name) then
+    local who = (e[1] == "touch") and e[6] or e[5]
+    if e[1] == "touch" then
+      if (not who or not S.player or lower(who) == lower(S.player.name)) and hitCross(e, bx, by, bw) then
+        return nil
+      end
+    elseif not who or not S.player or lower(who) == lower(S.player.name) then
       local ch, code = e[3], e[4]
       if code == 28 or code == 156 or ch == 13 then return buf
       elseif code == 1 then return nil
@@ -581,7 +617,8 @@ local function modal(title, body)
   local bh = #lines + 5
   local bx, by = math.floor((W - bw) / 2) + 1, math.max(2, math.floor((H - bh) / 2) + 1)
   fill(bx, by, bw, bh, C.dlg)
-  text(bx + 2, by + 1, pad(title, bw - 4), C.gold, C.dlg)
+  text(bx + 2, by + 1, pad(title, bw - 4 - CROSS_W), C.gold, C.dlg)
+  drawCross(bx, by, bw)
   for i, l in ipairs(lines) do text(bx + 2, by + 2 + i, l, C.text, C.dlg) end
   text(bx + 2, by + bh - 1, pad("Коснитесь экрана, чтобы закрыть", bw - 4), C.dim, C.dlg)
   while true do
@@ -815,15 +852,170 @@ local function paged(count, y0)
   return first, math.min(count, first + per - 1)
 end
 
-local function drawIdle()
-  local bw, bh = 44, 11
-  local bx, by = math.floor((W - bw) / 2) + 1, math.floor((H - bh) / 2) + 1
-  fill(bx, by, bw, bh, C.panel)
-  local function ctr(row, s, fg)
-    text(bx + math.floor((bw - unicode.len(s)) / 2), by + row, s, fg, C.panel)
+---------------------------------------------------------- заставка (экран ожидания)
+local SPL_BAND = 5            -- высота полосы фонового градиента, строк
+local SPL_BOX_W, SPL_BOX_H = 40, 5
+local SPL_GLYPH = {           -- крупные буквы: # = закрашено
+  ["К"] = { "#   #", "#  # ", "###  ", "#  # ", "#   #" },
+  ["В"] = { "#### ", "#   #", "#### ", "#   #", "#### " },
+  ["Е"] = { "#####", "#    ", "#### ", "#    ", "#####" },
+  ["С"] = { " ####", "#    ", "#    ", "#    ", " ####" },
+  ["Т"] = { "#####", "  #  ", "  #  ", "  #  ", "  #  " },
+  ["Ы"] = { "#     #", "#     #", "####  #", "#   # #", "####  #" },
+}
+local SPL_WORD = "КВЕСТЫ"
+local splashStep = 0
+local splashStars = {}
+
+local function mix(a, b, t)
+  local function ch(c, d) return math.floor(c / d) % 256 end
+  local r  = math.floor(ch(a, 65536) * (1 - t) + ch(b, 65536) * t + 0.5)
+  local g  = math.floor(ch(a, 256)   * (1 - t) + ch(b, 256)   * t + 0.5)
+  local bl = math.floor((a % 256)    * (1 - t) + (b % 256)    * t + 0.5)
+  return r * 65536 + g * 256 + bl
+end
+
+local function skyAt(y)
+  local bands = math.max(1, math.ceil(H / SPL_BAND))
+  local i = math.floor((y - 1) / SPL_BAND)
+  return mix(0x0a1024, 0x2b1246, i / math.max(1, bands - 1))
+end
+
+local function spaced(s)
+  local t = {}
+  for i = 1, unicode.len(s) do t[#t + 1] = unicode.sub(s, i, i) end
+  return table.concat(t, " ")
+end
+
+local function splashGeom()
+  local g = {}
+  g.sx = (W >= 120) and 3 or 2
+  g.sy = (H >= 40) and 2 or 1
+  local n = unicode.len(SPL_WORD)
+  local gw = 0
+  for i = 1, n do gw = gw + #SPL_GLYPH[unicode.sub(SPL_WORD, i, i)][1] * g.sx end
+  g.gw = gw + (n - 1) * g.sx
+  g.gh = 5 * g.sy
+  local blockH = g.gh + 7 + SPL_BOX_H
+  g.top  = math.max(2, math.floor((H - blockH) / 2) + 1)
+  g.gx   = math.floor((W - g.gw) / 2) + 1
+  g.subY = g.top + g.gh + 2
+  g.divY = g.subY + 2
+  g.boxX = math.floor((W - SPL_BOX_W) / 2) + 1
+  g.boxY = g.divY + 3
+  return g
+end
+
+local function makeStars(g)
+  splashStars = {}
+  local seed = 20260
+  local function rnd(n) seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n + 1 end
+  for _ = 1, math.floor(W * H / 90) do
+    local x, y = rnd(math.max(1, W - 4)) + 2, rnd(math.max(1, H - 4)) + 2
+    local inside = x >= g.gx - 4 and x <= g.gx + g.gw + 4 and y >= g.top - 1 and y <= g.boxY + SPL_BOX_H
+    if not inside then splashStars[#splashStars + 1] = { x = x, y = y, ph = rnd(3), k = rnd(4) } end
   end
-  ctr(3, "КВЕСТЫ", C.accent)
-  ctr(6, "Встаньте на PIM", C.text)
+end
+
+local STAR_COL = { 0x3a4a7a, 0x8fa4e8, 0xffffff }
+local function drawStars(onlyThird)
+  for i, st in ipairs(splashStars) do
+    if not onlyThird or (i + splashStep) % 3 == 0 then
+      gpu.setBackground(skyAt(st.y))
+      gpu.setForeground(STAR_COL[(st.ph + splashStep) % 3 + 1])
+      gpu.set(st.x, st.y, st.k == 1 and "+" or "·")
+    end
+  end
+end
+
+local function drawSplashFrame()
+  local fg = 0x2f7d1a
+  gpu.setForeground(fg)
+  gpu.setBackground(skyAt(1));  gpu.set(1, 1, "╔" .. string.rep("═", W - 2) .. "╗")
+  gpu.setBackground(skyAt(H));  gpu.set(1, H, "╚" .. string.rep("═", W - 2) .. "╝")
+  for i = 0, math.ceil(H / SPL_BAND) - 1 do
+    local y0 = math.max(2, i * SPL_BAND + 1)
+    local y1 = math.min(H - 1, (i + 1) * SPL_BAND)
+    if y1 >= y0 then
+      gpu.setBackground(skyAt(y0))
+      gpu.fill(1, y0, 1, y1 - y0 + 1, "║")
+      gpu.fill(W, y0, 1, y1 - y0 + 1, "║")
+    end
+  end
+end
+
+local function drawTitle(g)
+  local n = unicode.len(SPL_WORD)
+  for pass = 1, 2 do                       -- 1 = тень, 2 = сами буквы
+    local x = g.gx
+    for i = 1, n do
+      local glyph = SPL_GLYPH[unicode.sub(SPL_WORD, i, i)]
+      local gwid = #glyph[1]
+      for r = 1, 5 do
+        gpu.setForeground(pass == 1 and 0x04060e or mix(0xc4ff9a, 0x3fae22, (r - 1) / 4))
+        local row, c = glyph[r], 1
+        while c <= gwid do
+          if row:sub(c, c) == "#" then
+            local c2 = c
+            while c2 < gwid and row:sub(c2 + 1, c2 + 1) == "#" do c2 = c2 + 1 end
+            local dx = (pass == 1) and 1 or 0
+            local dy = (pass == 1) and 1 or 0
+            gpu.fill(x + (c - 1) * g.sx + dx, g.top + (r - 1) * g.sy + dy, (c2 - c + 1) * g.sx, g.sy, "█")
+            c = c2 + 1
+          else
+            c = c + 1
+          end
+        end
+      end
+      x = x + gwid * g.sx + g.sx
+    end
+  end
+end
+
+local function drawSplashPrompt(g, bright)
+  local bg = 0x121833
+  gpu.setBackground(bg)
+  gpu.fill(g.boxX, g.boxY, SPL_BOX_W, SPL_BOX_H, " ")
+  gpu.setForeground(0x2f7d1a)
+  gpu.set(g.boxX, g.boxY, "╭" .. string.rep("─", SPL_BOX_W - 2) .. "╮")
+  gpu.set(g.boxX, g.boxY + SPL_BOX_H - 1, "╰" .. string.rep("─", SPL_BOX_W - 2) .. "╯")
+  gpu.fill(g.boxX, g.boxY + 1, 1, SPL_BOX_H - 2, "│")
+  gpu.fill(g.boxX + SPL_BOX_W - 1, g.boxY + 1, 1, SPL_BOX_H - 2, "│")
+  local s = "▼   ВСТАНЬТЕ НА PIM   ▼"
+  gpu.setForeground(bright and 0x68f029 or 0x3a7d1e)
+  gpu.set(g.boxX + math.floor((SPL_BOX_W - unicode.len(s)) / 2), g.boxY + math.floor(SPL_BOX_H / 2), s)
+end
+
+local function drawIdle()
+  UI.oy = 0
+  local g = splashGeom()
+  -- фон: ступенчатый градиент
+  for i = 0, math.ceil(H / SPL_BAND) - 1 do
+    local y0 = i * SPL_BAND + 1
+    gpu.setBackground(skyAt(y0))
+    gpu.fill(1, y0, W, math.min(SPL_BAND, H - y0 + 1), " ")
+  end
+  makeStars(g)
+  drawStars(false)
+  drawSplashFrame()
+  drawTitle(g)
+  -- подзаголовок и разделитель
+  local sub = spaced("МАГАЗИН КОМПЛЕКТОВ")
+  gpu.setBackground(skyAt(g.subY)); gpu.setForeground(C.gold)
+  gpu.set(math.floor((W - unicode.len(sub)) / 2) + 1, g.subY, sub)
+  local div = string.rep("─", 18) .. "  ◆  " .. string.rep("─", 18)
+  gpu.setBackground(skyAt(g.divY)); gpu.setForeground(0x4a5a8a)
+  gpu.set(math.floor((W - unicode.len(div)) / 2) + 1, g.divY, div)
+  drawSplashPrompt(g, true)
+end
+
+-- вызывается раз в ~0.7 с, пока на PIM никого нет: мерцание звёзд и «дыхание» надписи
+local function idleTick()
+  if S.player then return end
+  UI.oy = 0
+  splashStep = splashStep + 1
+  drawStars(true)
+  drawSplashPrompt(splashGeom(), splashStep % 2 == 0)
 end
 
 local function switchTab(t)
@@ -957,8 +1149,8 @@ local function screenKits()
     local k = list[i]
     local y = LIST_Y + (i - first) * 4
     local stock = kitStock(k, avail)
-    card(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY .. "   Ресурсов: " .. #k.items ..
-                     "   В наличии: " .. stock .. " шт", stock > 0 and C.text or C.red)
+    kitCard(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY,
+            "В наличии: " .. stock .. " шт", stock > 0)
     rb(y, 0, BW, stock > 0 and "Перейти" or "Нет в наличии",
       { disabled = stock <= 0, bg = C.tabOn, fn = function() nav({ view = "kit", kitId = k.id }) end })
   end
@@ -1332,14 +1524,21 @@ local function main()
 
   while running do
     local timeout = nil
-    if S.player and refreshRemaining() > 0 then timeout = 1 end   -- только пока идёт кулдаун
+    if S.player then
+      if refreshRemaining() > 0 then timeout = 1 end   -- только пока идёт кулдаун
+    else
+      timeout = 0.7                                    -- анимация заставки
+    end
     local e = table.pack(safePull(event.pull, timeout))
     local ok, err = xpcall(function()
       local name = e[1]
       if name == "player_on" then onPlayerOn(e)
       elseif name == "player_off" then onPlayerOff()
       elseif name == "touch" then onTouch(e)
-      elseif name == nil and S.player then redrawFooter() end      -- обновить таймер кнопки
+      elseif name == nil then
+        if S.player then redrawFooter()                -- обновить таймер кнопки
+        else idleTick() end                            -- анимация заставки
+      end
       if pendingOff then pendingOff = false; onPlayerOff() end
     end, debug.traceback)
     if not ok then reportError(err) end
