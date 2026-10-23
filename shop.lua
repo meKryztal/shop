@@ -165,7 +165,9 @@ local function labelOf(it, var)
   local l = ruName(it.name, it.damage, tostring(it.label or it.name))
   if var and var ~= "" then
     local fl = fluidVariant(it)
-    local tag = (fl ~= "") and fl or ((var:sub(1, 1) == "#") and var:sub(1, 7) or var)
+    local tag
+    if var:sub(1, 1) == "#" then tag = ((fl ~= "") and (fl .. " ") or "") .. var:sub(1, 7)
+    else tag = (fl ~= "") and fl or var end
     l = l .. " (" .. tag .. ")"
   end
   return l
