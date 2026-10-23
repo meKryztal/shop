@@ -425,14 +425,14 @@ end
 --
 --   колонка 1 и колонка W - пустые поля; содержимое занимает 2 .. W-1
 --   строки: 1 шапка | 3-5 вкладки | 6 сообщение | 7+ содержимое (сдвиг UI.oy) |
---           список карточек по 3 строки + 1 пропуск | H-2..H подвал
+--           список карточек по 3 строки + 1 пропуск | H-3..H-1 подвал (строка H пустая)
 ----------------------------------------------------------------------
 local W, H = 160, 50
 local C = {
   bg = 0x101010, panel = 0x1e1e1e, panel2 = 0x2d2d2d, bar = 0x0a0a0a,
   text = 0xdddddd, dim = 0x888888, accent = 0x68f029, gold = 0xf2b233,
   red = 0xff5555, blue = 0x2f5fb3, green = 0x2f7d1a, disabled = 0x262626,
-  tabOn = 0x3a7d1e, tabOff = 0x2a2a2a, dlg = 0x202020,
+  tabOn = 0x3a7d1e, tabOff = 0x2a2a2a, dlg = 0x2a2a2a,
 }
 local UI = { btns = {}, tag = nil, oy = 0 }   -- oy: сдвиг по Y для содержимого вкладок
 local CONTENT_OY = 1                          -- на сколько строк содержимое ниже базовой сетки
@@ -455,6 +455,16 @@ local function text(x, y, s, fg, bg)
   gpu.setBackground(bg or C.bg)
   gpu.setForeground(fg or C.text)
   gpu.set(x, y + UI.oy, s)
+end
+
+-- рамка из символов псевдографики (края окна, чтобы не сливались с фоном)
+local function frame(x, y, w, h, fg, bg)
+  gpu.setBackground(bg or C.dlg)
+  gpu.setForeground(fg or C.accent)
+  gpu.set(x, y + UI.oy, "╭" .. string.rep("─", w - 2) .. "╮")
+  gpu.set(x, y + UI.oy + h - 1, "╰" .. string.rep("─", w - 2) .. "╯")
+  gpu.fill(x, y + UI.oy + 1, 1, h - 2, "│")
+  gpu.fill(x + w - 1, y + UI.oy + 1, 1, h - 2, "│")
 end
 
 -- текст по центру экрана
@@ -579,9 +589,11 @@ local function prompt(title, initial, maxLen)
   local buf = initial or ""
   local function draw()
     fill(bx, by, bw, bh, C.dlg)
+    frame(bx, by, bw, bh, C.accent, C.dlg)                 -- рамка окна
     text(bx + 2, by + 1, pad(title, bw - 4 - CROSS_W), C.gold, C.dlg)
     drawCross(bx, by, bw)
-    fill(bx + 2, by + 3, bw - 4, 1, 0x000000)
+    frame(bx + 2, by + 2, bw - 4, 3, C.dim, C.dlg)         -- рамка поля ввода
+    fill(bx + 3, by + 3, bw - 6, 1, 0x000000)
     local shown, room = buf, bw - 8
     if unicode.len(shown) > room then shown = unicode.sub(shown, unicode.len(shown) - room + 1) end
     text(bx + 3, by + 3, shown .. "_", C.accent, 0x000000)
@@ -626,6 +638,7 @@ local function modal(title, body)
   local bh = #lines + 5
   local bx, by = math.floor((W - bw) / 2) + 1, math.max(2, math.floor((H - bh) / 2) + 1)
   fill(bx, by, bw, bh, C.dlg)
+  frame(bx, by, bw, bh, C.gold, C.dlg)                     -- рамка окна
   text(bx + 2, by + 1, pad(title, bw - 4 - CROSS_W), C.gold, C.dlg)
   drawCross(bx, by, bw)
   for i, l in ipairs(lines) do text(bx + 2, by + 2 + i, l, C.text, C.dlg) end
@@ -856,7 +869,7 @@ end
 ----------------------------------------------------------------------
 -- сколько карточек влезает: от строки y0 до подвала, шаг 4 (3 строки + пропуск)
 local function paged(count, y0)
-  local per = math.max(1, math.floor((H - 1 - y0 - UI.oy) / 4))
+  local per = math.max(1, math.floor((H - 2 - y0 - UI.oy) / 4))
   local pages = math.max(1, math.ceil(count / per))
   if S.page > pages then S.page = pages end
   if S.page < 1 then S.page = 1 end
@@ -1053,8 +1066,8 @@ local function drawHeader()
 end
 
 local function drawFooter()
-  local y = H - 2
-  fill(1, y, W, 3, C.bar)
+  local y = H - 3                          -- кнопки на 1 строку выше нижнего края
+  fill(1, y, W, 4, C.bar)
   addBtn(2, y, 14, 3, "Назад", { disabled = not S.backFn, fn = S.backFn })
   addBtn(18, y, 6, 3, "<", { disabled = S.page <= 1, fn = function() S.page = S.page - 1; render() end })
   text(26, y + 1, pad("стр " .. S.page .. "/" .. (S.pages or 1), 11), C.dim, C.bar)
@@ -1246,8 +1259,9 @@ local function screenKitEdit()
     local it = kit.items[i]
     local y = y0 + (i - first) * 4
     local c = cache.byKey[itemKey(it.name, it.damage)]
-    card(y, it.label .. "   [" .. it.name .. ":" .. it.damage .. "]   x" .. it.qty,
-         "В ME: " .. (c and c.size or 0), nil, reserve)
+    -- одна строка, как у остальных карточек
+    lineCard(y, it.label .. "   [" .. it.name .. ":" .. it.damage .. "]",
+             "x" .. it.qty .. "   В ME: " .. (c and c.size or 0), C.text, reserve)
     local off = rb(y, 0, BW2, "Убрать", { fn = function()
       table.remove(kit.items, i); saveDB(); render()
     end })
@@ -1321,7 +1335,8 @@ local function screenPick()
   for i = first, last do
     local e = list[i]
     local y = LIST_Y + (i - first) * 4
-    card(y, e[3] .. "   [" .. e[1] .. ":" .. e[2] .. "]", "В ME: " .. e[4])
+    -- одна строка, как у остальных карточек
+    lineCard(y, e[3] .. "   [" .. e[1] .. ":" .. e[2] .. "]", "В ME: " .. e[4], C.text)
     rb(y, 0, BW, "Выбрать", { bg = C.tabOn, fn = function() pickItem(e) end })
   end
   S.backFn = function()
@@ -1582,6 +1597,25 @@ local function ownerCli()
   end
 end
 
+-- диагностика: lua kitshop.lua dump [часть названия]
+-- печатает все поля первых 10 подходящих предметов из ME (чтобы найти поле NBT/хеша)
+local function dumpCli()
+  local f = lower(ARGS[2] or "")
+  local list = me.getItemsInNetwork()
+  local shown = 0
+  for _, it in ipairs(list) do
+    if f == "" or lower(tostring(it.label) .. " " .. tostring(it.name)):find(f, 1, true) then
+      local parts = {}
+      for k, v in pairs(it) do parts[#parts + 1] = tostring(k) .. "=" .. tostring(v) end
+      table.sort(parts)
+      print(table.concat(parts, "  "))
+      shown = shown + 1
+      if shown >= 10 then break end
+    end
+  end
+  if shown == 0 then print("Ничего не найдено.") end
+end
+
 -- Надзиратель: при любой неожиданной ошибке магазин перезапускается,
 -- а не падает в консоль (к которой мог бы получить доступ игрок).
 local function supervised()
@@ -1595,6 +1629,7 @@ local function supervised()
 end
 
 if ARGS[1] == "owner" then ownerCli()
+elseif ARGS[1] == "dump" then dumpCli()
 elseif ARGS[1] == "debug" then            -- без автоперезапуска, Ctrl+Alt+C работает
   local ok, err = xpcall(main, debug.traceback)
   if not ok then print(err) end
