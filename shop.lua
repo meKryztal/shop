@@ -275,7 +275,6 @@ end
 -- и не больше PICK_MAX штук - на огромной ME это не съедает память.
 local function pickerScan(filter)
   cache.items = {}
-  collectgarbage()
   return pcall(function()
     local list = me.getItemsInNetwork()
     if type(list) ~= "table" then error("ME вернула " .. type(list)) end
@@ -423,8 +422,8 @@ local C = {
 }
 local UI = { btns = {}, tag = nil }
 
-local LIST_Y = 8        -- начало списка карточек на обычных экранах
-local SUB_Y  = 11       -- начало списка на вкладке «Создание»
+local LIST_Y = 10       -- начало списка карточек на обычных экранах
+local SUB_Y  = 13       -- начало списка на вкладке «Создание»
 local BW     = 18       -- стандартная ширина кнопки в карточке
 local BW2    = 14       -- ширина кнопок, когда их две в ряд
 
@@ -463,7 +462,7 @@ end
 -- кнопка, прижатая к правому краю содержимого (последняя колонка = W-1).
 -- off - отступ от правого края; возвращает отступ для следующей кнопки слева.
 local function rb(y, off, w, label, o)
-  addBtn(W - off - w, y, w, 2, label, o)
+  addBtn(W - off - w, y, w, 3, label, o)
   return off + w + 1
 end
 
@@ -471,9 +470,9 @@ end
 local function card(y, title, sub, subColor, reserve)
   reserve = reserve or (BW + 2)
   local tw = math.max(1, W - reserve - 4)
-  fill(2, y, W - 2, 2, C.panel)
+  fill(2, y, W - 2, 3, C.panel)
   text(3, y, pad(title, tw), C.accent, C.panel)
-  text(3, y + 1, pad(sub, tw), subColor or C.dim, C.panel)
+  text(3, y + 2, pad(sub, tw), subColor or C.dim, C.panel)
 end
 
 ----------------------------------------------------------------------
@@ -485,9 +484,9 @@ local running = true
 local render, nav, flash, status   -- объявлены заранее
 
 local function drawMessage()
-  fill(1, 4, W, 1, C.bg)
+  fill(1, 5, W, 1, C.bg)
   if S.msg and S.msg ~= "" then
-    text(2, 4, pad(S.msg, W - 2), S.msgOk == false and C.red or C.accent, C.bg)
+    text(2, 6, pad(S.msg, W - 2), S.msgOk == false and C.red or C.accent, C.bg)
   end
 end
 
@@ -498,6 +497,17 @@ nav = function(fields, msg, ok)
   S.page = 1; S.confirm = nil; S.backFn = nil
   S.msg = msg or ""; S.msgOk = (ok ~= false)
   render()
+end
+
+-- Ctrl+Alt+C: ожидание события бросает "interrupted". В режиме киоска глотаем это
+-- и ждём дальше (в режиме debug ошибка пробрасывается, программу можно остановить).
+local function safePull(fn, ...)
+  while true do
+    local r = table.pack(pcall(fn, ...))
+    if r[1] then return table.unpack(r, 2, r.n) end
+    if ARGS[1] == "debug" or not tostring(r[2]):find("interrupted", 1, true) then error(r[2], 0) end
+    os.sleep(0.05)
+  end
 end
 
 ----------------------------------------------------------------------
@@ -520,7 +530,7 @@ local function prompt(title, initial, maxLen)
   end
   draw()
   while true do
-    local e = table.pack(event.pullMultiple("key_down", "player_off"))
+    local e = table.pack(safePull(event.pullMultiple, "key_down", "player_off"))
     if e[1] == "player_off" then pendingOff = true; return nil end
     local who = e[5]
     if not who or not S.player or lower(who) == lower(S.player.name) then
@@ -557,7 +567,7 @@ local function modal(title, body)
   for i, l in ipairs(lines) do text(bx + 2, by + 2 + i, l, C.text, C.dlg) end
   text(bx + 2, by + bh - 1, pad("Коснитесь экрана, чтобы закрыть", bw - 4), C.dim, C.dlg)
   while true do
-    local e = table.pack(event.pullMultiple("touch", "key_down", "player_off"))
+    local e = table.pack(safePull(event.pullMultiple, "touch", "key_down", "player_off"))
     if e[1] == "player_off" then pendingOff = true; return end
     local who = (e[1] == "touch") and e[6] or e[5]
     if not who or not S.player or lower(who) == lower(S.player.name) then return end
@@ -737,7 +747,7 @@ end
 ----------------------------------------------------------------------
 -- сколько карточек влезает: от строки y0 до подвала, шаг 3
 local function paged(count, y0)
-  local per = math.max(1, math.floor((H - 2 - y0) / 3))
+  local per = math.max(1, math.floor((H - 1 - y0) / 4))
   local pages = math.max(1, math.ceil(count / per))
   if S.page > pages then S.page = pages end
   if S.page < 1 then S.page = 1 end
@@ -781,20 +791,20 @@ local function drawHeader()
     local on = (S.tab == t[1])
     local x = (i - 1) * tw + 1
     local w = (i == n) and (W - x + 1) or tw
-    addBtn(x, 2, w, 2, t[2],
+    addBtn(x, 2, w, 3, t[2],
       { bg = on and C.tabOn or C.tabOff, fg = on and 0xffffff or C.dim, fn = function() switchTab(t[1]) end })
   end
 end
 
 local function drawFooter()
-  local y = H - 1
-  fill(1, y, W, 2, C.bar)
-  addBtn(2, y, 14, 2, "Назад", { disabled = not S.backFn, fn = S.backFn })
-  addBtn(18, y, 6, 2, "<", { disabled = S.page <= 1, fn = function() S.page = S.page - 1; render() end })
-  text(26, y, pad("стр " .. S.page .. "/" .. (S.pages or 1), 11), C.dim, C.bar)
-  addBtn(38, y, 6, 2, ">", { disabled = S.page >= (S.pages or 1), fn = function() S.page = S.page + 1; render() end })
+  local y = H - 2
+  fill(1, y, W, 3, C.bar)
+  addBtn(2, y, 14, 3, "Назад", { disabled = not S.backFn, fn = S.backFn })
+  addBtn(18, y, 6, 3, "<", { disabled = S.page <= 1, fn = function() S.page = S.page - 1; render() end })
+  text(26, y + 1, pad("стр " .. S.page .. "/" .. (S.pages or 1), 11), C.dim, C.bar)
+  addBtn(38, y, 6, 3, ">", { disabled = S.page >= (S.pages or 1), fn = function() S.page = S.page + 1; render() end })
   local rem = refreshRemaining()
-  addBtn(46, y, 24, 2, rem > 0 and ("Обновить (" .. rem .. "с)") or "Обновить",
+  addBtn(46, y, 24, 3, rem > 0 and ("Обновить (" .. rem .. "с)") or "Обновить",
     { disabled = rem > 0, bg = C.green, fn = doRefresh })
   rb(y, 0, 20, "Обратная связь", { bg = C.blue, fn = sendFeedback })
 end
@@ -812,16 +822,16 @@ local function screenKitView()
   if not kit then S.view = "list"; return false end
   local avail = availFn()
   local stock = kitStock(kit, avail)
-  text(2, 5, pad(kit.name, W - 34), C.accent, C.bg)
-  text(2, 6, pad("Цена: " .. fmt(kit.price) .. " " .. CONFIG.CURRENCY .. "   В наличии: " .. stock .. " шт", W - 34),
+  text(2, 6, pad(kit.name, W - 34), C.accent, C.bg)
+  text(2, 8, pad("Цена: " .. fmt(kit.price) .. " " .. CONFIG.CURRENCY .. "   В наличии: " .. stock .. " шт", W - 34),
        stock > 0 and C.text or C.red, C.bg)
-  rb(5, 0, 30, "Купить за " .. fmt(kit.price),
+  rb(6, 0, 30, "Купить за " .. fmt(kit.price),
     { disabled = stock <= 0, bg = C.tabOn, fn = function() doBuy(kit) end })
 
   local first, last = paged(#kit.items, LIST_Y)
   for i = first, last do
     local it = kit.items[i]
-    local y = LIST_Y + (i - first) * 3
+    local y = LIST_Y + (i - first) * 4
     local a = avail(itemKey(it.name, it.damage))
     card(y, it.label .. "   x" .. it.qty, "В наличии: " .. a .. (a >= it.qty and "" or "   (не хватает)"),
          a >= it.qty and C.dim or C.red, 0)
@@ -833,12 +843,12 @@ end
 local function screenPurchase(p)
   local pu = findPurchase(p, S.purchaseId)
   if not pu then S.view = "mine"; return false end
-  text(2, 5, pad("Покупка #" .. pu.id .. ": " .. pu.kit, W - 2), C.accent, C.bg)
-  text(2, 6, "Забирайте ресурсы по одному. Нужно свободное место в инвентаре.", C.dim, C.bg)
+  text(2, 6, pad("Покупка #" .. pu.id .. ": " .. pu.kit, W - 2), C.accent, C.bg)
+  text(2, 8, "Забирайте ресурсы по одному. Нужно свободное место в инвентаре.", C.dim, C.bg)
   local first, last = paged(#pu.items, LIST_Y)
   for i = first, last do
     local it = pu.items[i]
-    local y = LIST_Y + (i - first) * 3
+    local y = LIST_Y + (i - first) * 4
     card(y, it.label, it.qty > 0 and ("Осталось выдать: " .. it.qty) or "Выдано полностью",
          it.qty > 0 and C.gold or C.dim)
     rb(y, 0, BW, it.qty > 0 and "Забрать" or "Выдано",
@@ -853,13 +863,13 @@ end
 
 local function screenMine(p)
   purgePurchases(p)
-  text(2, 5, "Незабранные покупки", C.accent, C.bg)
-  text(2, 6, "Здесь то, что вы оплатили, но ещё не забрали.", C.dim, C.bg)
+  text(2, 6, "Незабранные покупки", C.accent, C.bg)
+  text(2, 8, "Здесь то, что вы оплатили, но ещё не забрали.", C.dim, C.bg)
   local first, last = paged(#p.purchases, LIST_Y)
   if #p.purchases == 0 then text(2, LIST_Y, "Пока ничего нет.", C.dim, C.bg) end
   for i = first, last do
     local pu = p.purchases[i]
-    local y = LIST_Y + (i - first) * 3
+    local y = LIST_Y + (i - first) * 4
     card(y, "#" .. pu.id .. "  " .. pu.kit, "Осталось позиций: " .. purchasePending(pu), C.gold)
     rb(y, 0, BW, "Открыть", { bg = C.tabOn, fn = function() nav({ view = "purchase", purchaseId = pu.id }) end })
   end
@@ -878,16 +888,16 @@ local function screenKits()
   local list = {}
   for _, k in ipairs(db.kits) do if #k.items > 0 then list[#list + 1] = k end end
   local pend = pendingCount(p)
-  text(2, 5, "Комплектов: " .. #list, C.accent, C.bg)
-  text(2, 6, "Остатки ME: " .. ageText(), C.dim, C.bg)
-  rb(5, 0, 30, "Незабранное: " .. pend,
+  text(2, 6, "Комплектов: " .. #list, C.accent, C.bg)
+  text(2, 8, "Остатки ME: " .. ageText(), C.dim, C.bg)
+  rb(6, 0, 30, "Незабранное: " .. pend,
     { disabled = (pend == 0), bg = C.gold, fg = 0x000000, fn = function() nav({ view = "mine" }) end })
 
   local first, last = paged(#list, LIST_Y)
   if #list == 0 then text(2, LIST_Y, "Владелец ещё не добавил комплекты.", C.dim, C.bg) end
   for i = first, last do
     local k = list[i]
-    local y = LIST_Y + (i - first) * 3
+    local y = LIST_Y + (i - first) * 4
     local stock = kitStock(k, avail)
     card(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY .. "   Ресурсов: " .. #k.items ..
                      "   В наличии: " .. stock .. " шт", stock > 0 and C.text or C.red)
@@ -899,9 +909,9 @@ end
 ---------------------------------------------------------- вкладка: пополнение
 local function screenTopup()
   local p = getPlayer(S.player.name)
-  text(2, 5, "Положите ресурсы в инвентарь и нажмите «Внести всё» или «Ввести число».", C.accent, C.bg)
-  text(2, 6, "Баланс: " .. fmt(p.balance) .. " " .. CONFIG.CURRENCY, C.gold, C.bg)
-  rb(5, 0, 30, "Проверить инвентарь", { fn = function() scanInventory(); render() end })
+  text(2, 6, "Положите ресурсы в инвентарь и нажмите «Внести всё» или «Ввести число».", C.accent, C.bg)
+  text(2, 8, "Баланс: " .. fmt(p.balance) .. " " .. CONFIG.CURRENCY, C.gold, C.bg)
+  rb(6, 0, 30, "Проверить инвентарь", { fn = function() scanInventory(); render() end })
 
   local list = db.topup
   local first, last = paged(#list, LIST_Y)
@@ -909,7 +919,7 @@ local function screenTopup()
   local reserve = BW * 2 + 1 + 2
   for i = first, last do
     local e = list[i]
-    local y = LIST_Y + (i - first) * 3
+    local y = LIST_Y + (i - first) * 4
     local have = (S.inv or {})[itemKey(e.name, e.damage)] or 0
     card(y, e.label .. "  -  " .. fmt(e.price) .. " " .. CONFIG.CURRENCY .. " за шт",
          "У вас в инвентаре: " .. have .. " шт", have > 0 and C.text or C.dim, reserve)
@@ -932,11 +942,11 @@ local function subBar()
   local bw = math.floor((region - gap * 2) / 3)
   for i, s in ipairs(subs) do
     local on = (S.csub == s[1])
-    addBtn(2 + (i - 1) * (bw + gap), 5, bw, 2, s[2],
+    addBtn(2 + (i - 1) * (bw + gap), 6, bw, 3, s[2],
       { bg = on and C.blue or C.panel2, fn = function() nav({ csub = s[1], view = "list", filter = "" }) end })
   end
   local exitArmed = (S.confirm == "exit")
-  rb(5, 0, exitW, exitArmed and "Точно?" or "Выход",
+  rb(6, 0, exitW, exitArmed and "Точно?" or "Выход",
     { bg = exitArmed and C.red or C.panel2, fn = function()
       if S.confirm == "exit" then running = false else S.confirm = "exit"; render() end
     end })
@@ -950,18 +960,18 @@ local function screenKitEdit()
   local function bx(i) return 2 + (i - 1) * (bw + gap) end
   local lastW = (W - 1) - bx(n) + 1
   local armed = (S.confirm == "del" .. kit.id)
-  addBtn(bx(1), 5, bw, 2, "Название", { fn = function()
+  addBtn(bx(1), 6, bw, 3, "Название", { fn = function()
     local nm = prompt("Название комплекта:", kit.name, 40)
     if nm and trim(nm) ~= "" then kit.name = trim(nm); saveDB() end
     render()
   end })
-  addBtn(bx(2), 5, bw, 2, "Цена: " .. fmt(kit.price), { fn = function()
+  addBtn(bx(2), 6, bw, 3, "Цена: " .. fmt(kit.price), { fn = function()
     local v = askNumber("Цена комплекта (" .. CONFIG.CURRENCY .. "):", fmt(kit.price), false)
     if v then kit.price = round2(v); saveDB() end
     render()
   end })
-  addBtn(bx(3), 5, bw, 2, "+ Ресурс", { bg = C.tabOn, fn = function() openPicker("kit") end })
-  addBtn(bx(4), 5, lastW, 2, armed and "Точно удалить?" or "Удалить комплект",
+  addBtn(bx(3), 6, bw, 3, "+ Ресурс", { bg = C.tabOn, fn = function() openPicker("kit") end })
+  addBtn(bx(4), 6, lastW, 3, armed and "Точно удалить?" or "Удалить комплект",
     { bg = armed and C.red or C.panel2, fn = function()
       if S.confirm == "del" .. kit.id then
         local _, idx = findKit(kit.id)
@@ -970,7 +980,7 @@ local function screenKitEdit()
       else S.confirm = "del" .. kit.id; render() end
     end })
 
-  text(2, 7, pad("Комплект: " .. kit.name .. "   Цена: " .. fmt(kit.price) .. " " .. CONFIG.CURRENCY ..
+  text(2, 9, pad("Комплект: " .. kit.name .. "   Цена: " .. fmt(kit.price) .. " " .. CONFIG.CURRENCY ..
        "   Склад: " .. kitStock(kit, availFn()) .. " шт", W - 2), C.accent, C.bg)
   local y0 = LIST_Y + 1
   local first, last = paged(#kit.items, y0)
@@ -978,7 +988,7 @@ local function screenKitEdit()
   local reserve = BW2 * 2 + 1 + 2
   for i = first, last do
     local it = kit.items[i]
-    local y = y0 + (i - first) * 3
+    local y = y0 + (i - first) * 4
     local c = cache.byKey[itemKey(it.name, it.damage)]
     card(y, it.label .. "   x" .. it.qty, "В ME: " .. (c and c.size or 0) .. "   " .. it.name .. ":" .. it.damage,
          nil, reserve)
@@ -1037,14 +1047,14 @@ end
 
 local function screenPick()
   local hasFilter = S.filter and S.filter ~= ""
-  addBtn(2, 5, 44, 2, "Поиск: " .. (hasFilter and S.filter or "(нажмите)"), { fn = function()
+  addBtn(2, 6, 44, 3, "Поиск: " .. (hasFilter and S.filter or "(нажмите)"), { fn = function()
     local f = prompt("Поиск по названию:", S.filter or "", 40)
     if f then applyPickFilter(trim(f)) else render() end
   end })
-  addBtn(48, 5, 16, 2, "Сбросить", { disabled = not hasFilter, fn = function() applyPickFilter("") end })
+  addBtn(48, 6, 16, 3, "Сбросить", { disabled = not hasFilter, fn = function() applyPickFilter("") end })
   local info = "Найдено: " .. cache.pickTotal .. (cache.pickMore and ("  (показаны первые " .. #cache.items .. ", уточните поиск)") or "")
-  text(66, 5, pad(info, W - 66), C.dim, C.bg)
-  text(66, 6, pad("Данные ME: " .. ageText(), W - 66), C.dim, C.bg)
+  text(66, 6, pad(info, W - 66), C.dim, C.bg)
+  text(66, 8, pad("Данные ME: " .. ageText(), W - 66), C.dim, C.bg)
 
   local list = cache.items
   local first, last = paged(#list, LIST_Y)
@@ -1054,7 +1064,7 @@ local function screenPick()
   end
   for i = first, last do
     local e = list[i]
-    local y = LIST_Y + (i - first) * 3
+    local y = LIST_Y + (i - first) * 4
     card(y, e[3], "В ME: " .. e[4] .. "   " .. e[1] .. ":" .. e[2])
     rb(y, 0, BW, "Выбрать", { bg = C.tabOn, fn = function() pickItem(e) end })
   end
@@ -1072,7 +1082,7 @@ local function screenCreate()
   subBar()
 
   if S.csub == "kits" then
-    addBtn(2, 8, 28, 2, "+ Новый комплект", { bg = C.tabOn, fn = function()
+    addBtn(2, 9, 28, 3, "+ Новый комплект", { bg = C.tabOn, fn = function()
       local nm = prompt("Название нового комплекта:", "", 40)
       if nm and trim(nm) ~= "" then
         local kit = { id = db.nextKitId, name = trim(nm), price = 0, items = {} }
@@ -1087,21 +1097,21 @@ local function screenCreate()
     if #db.kits == 0 then text(2, SUB_Y, "Комплектов пока нет.", C.dim, C.bg) end
     for i = first, last do
       local k = db.kits[i]
-      local y = SUB_Y + (i - first) * 3
+      local y = SUB_Y + (i - first) * 4
       card(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY .. "   Ресурсов: " .. #k.items ..
                       "   Склад: " .. kitStock(k, avail) .. " шт")
       rb(y, 0, BW, "Изменить", { bg = C.tabOn, fn = function() nav({ view = "edit", kitId = k.id }) end })
     end
 
   elseif S.csub == "topup" then
-    addBtn(2, 8, 28, 2, "+ Добавить ресурс", { bg = C.tabOn, fn = function() openPicker("topup") end })
-    text(32, 8, "Что игрок может сдать, чтобы пополнить баланс.", C.dim, C.bg)
+    addBtn(2, 9, 28, 3, "+ Добавить ресурс", { bg = C.tabOn, fn = function() openPicker("topup") end })
+    text(32, 10, "Что игрок может сдать, чтобы пополнить баланс.", C.dim, C.bg)
     local first, last = paged(#db.topup, SUB_Y)
     if #db.topup == 0 then text(2, SUB_Y, "Ресурсов пополнения пока нет.", C.dim, C.bg) end
     local reserve = BW2 * 2 + 1 + 2
     for i = first, last do
       local e = db.topup[i]
-      local y = SUB_Y + (i - first) * 3
+      local y = SUB_Y + (i - first) * 4
       card(y, e.label, "Цена за 1 шт: " .. fmt(e.price) .. " " .. CONFIG.CURRENCY, nil, reserve)
       local off = rb(y, 0, BW2, "Убрать", { fn = function() table.remove(db.topup, i); saveDB(); render() end })
       rb(y, off, BW2, "Цена", { fn = function()
@@ -1113,12 +1123,12 @@ local function screenCreate()
 
   else -- отзывы
     local armed = (S.confirm == "clearfb")
-    addBtn(2, 8, 28, 2, armed and "Точно очистить?" or "Очистить все", { disabled = #db.feedback == 0,
+    addBtn(2, 9, 28, 3, armed and "Точно очистить?" or "Очистить все", { disabled = #db.feedback == 0,
       bg = armed and C.red or C.panel2, fn = function()
         if S.confirm == "clearfb" then db.feedback = {}; saveDB(); nav({ csub = "feedback", view = "list" }, "Отзывы очищены.", true)
         else S.confirm = "clearfb"; render() end
       end })
-    text(32, 8, "Сообщения игроков и автоматические отчёты об ошибках.", C.dim, C.bg)
+    text(32, 10, "Сообщения игроков и автоматические отчёты об ошибках.", C.dim, C.bg)
     local n = #db.feedback
     local first, last = paged(n, SUB_Y)
     if n == 0 then text(2, SUB_Y, "Отзывов пока нет.", C.dim, C.bg) end
@@ -1127,7 +1137,7 @@ local function screenCreate()
     for i = first, last do
       local idx = n - i + 1                 -- новые сверху
       local f = db.feedback[idx]
-      local y = SUB_Y + (i - first) * 3
+      local y = SUB_Y + (i - first) * 4
       card(y, (f.read and "" or "* ") .. dateStr(f.time) .. "  " .. f.player, f.text,
            f.read and C.dim or C.text, reserve)
       if not f.read then f.read = true; changed = true end
@@ -1245,8 +1255,11 @@ local function main()
   W, H = gpu.getResolution()
 
   -- защита киоска: Ctrl+Alt+C с клавиатуры игрока не должен останавливать программу
-  local origInterrupt = event.shouldInterrupt
-  if ARGS[1] ~= "debug" then event.shouldInterrupt = function() return false end end
+  local origInterrupt, origSoft = event.shouldInterrupt, event.shouldSoftInterrupt
+  if ARGS[1] ~= "debug" then
+    event.shouldInterrupt = function() return false end
+    event.shouldSoftInterrupt = function() return false end
+  end
 
   S = { player = nil }
   render()
@@ -1254,7 +1267,7 @@ local function main()
   while running do
     local timeout = nil
     if S.player and refreshRemaining() > 0 then timeout = 1 end   -- только пока идёт кулдаун
-    local e = table.pack(event.pull(timeout))
+    local e = table.pack(safePull(event.pull, timeout))
     local ok, err = xpcall(function()
       local name = e[1]
       if name == "player_on" then onPlayerOn(e)
@@ -1267,7 +1280,7 @@ local function main()
     if pendingOff then pendingOff = false; pcall(onPlayerOff) end
   end
 
-  event.shouldInterrupt = origInterrupt
+  event.shouldInterrupt, event.shouldSoftInterrupt = origInterrupt, origSoft
   gpu.setBackground(0x000000); gpu.setForeground(0xFFFFFF)
   gpu.fill(1, 1, W, H, " ")
   print("KitShop остановлен.")
