@@ -891,33 +891,63 @@ local function doBuy(kit)
       "Оплачено! Заберите ресурсы кнопками «Забрать» (можно по одному, можно позже).", true)
 end
 
--- Сырой стек из ME, соответствующий варианту (нужен, чтобы взять его NBT-хеш / отпечаток).
-local function meRawStack(name, damage, var)
-  local ok, list = pcall(me.getItemsInNetwork, { name = name, damage = damage })
-  if not ok or type(list) ~= "table" then return nil end
-  local fallback
-  for _, it in ipairs(list) do
-    if type(it) == "table" and it.name == name and math.floor(tonumber(it.damage) or 0) == damage then
-      local v = variantOf(it)
-      if v == (var or "") then return it end
-      if not fallback and sameVariant(v, var or "") then fallback = it end
+-- Ищет в таблице (в т.ч. во вложенных) первое значение по одному из ключей
+local function deepFind(t, keys, depth)
+  if type(t) ~= "table" or (depth or 0) > 4 then return nil end
+  for _, k in ipairs(keys) do
+    local v = t[k]
+    if v ~= nil and type(v) ~= "table" and type(v) ~= "function" and tostring(v) ~= "" then return v end
+  end
+  for k, v in pairs(t) do
+    if type(v) == "table" then
+      local r = deepFind(v, keys, (depth or 0) + 1)
+      if r ~= nil then return r end
     end
   end
-  return fallback
 end
 
--- Отпечаток для me.exportItem. Для баков с жидкостью вариант = название жидкости, а не хеш,
--- поэтому хеш берём из самого ME-стека - иначе ME отдаёт ПЕРВЫЙ попавшийся (пустой) бак.
+-- NBT-хеш конкретного варианта. getItemsInNetwork хеш не отдаёт, поэтому спрашиваем
+-- getAvailableItems("ALL"), где у каждой позиции есть отпечаток. Результат кэшируем.
+local hashCache = {}
+local function findNbtHash(name, damage, var)
+  local ck = itemKey(name, damage, var)
+  if hashCache[ck] then return hashCache[ck] end
+  local ok, list = pcall(me.getAvailableItems, "ALL")
+  if not ok or type(list) ~= "table" then
+    ok, list = pcall(me.getAvailableItems)
+  end
+  if not ok or type(list) ~= "table" then return nil end
+  local found
+  for _, e in pairs(list) do
+    if type(e) == "table" then
+      local id  = deepFind(e, { "id", "name" })
+      local dmg = tonumber(deepFind(e, { "dmg", "damage" })) or 0
+      if id == name and math.floor(dmg) == damage then
+        local ftab
+        local function findFluidTable(t, d)
+          if type(t) ~= "table" or d > 4 then return end
+          if type(t.fluid) == "table" then ftab = ftab or t.fluid; return end
+          for _, v in pairs(t) do if type(v) == "table" then findFluidTable(v, d + 1) end end
+        end
+        findFluidTable(e, 0)
+        local v = ftab and variantOf({ fluid = ftab }) or ""
+        local h = deepFind(e, { "nbt_hash", "nbtHash" })
+        if h and (v == var or (v == "" and var == "")) then found = tostring(h); break end
+      end
+    end
+  end
+  if found then hashCache[ck] = found end
+  return found
+end
+
+-- Отпечаток для me.exportItem: принимает только id, dmg и nbt_hash.
 local function exportFingerprint(it)
   local fp = { id = it.name, dmg = it.damage }
-  if it.var and it.var:sub(1, 1) == "#" then fp.nbt_hash = it.var:sub(2) end
-  local raw = meRawStack(it.name, it.damage, it.var)
-  if raw then
-    local h = nbtOf(raw)
+  if it.var and it.var:sub(1, 1) == "#" then
+    fp.nbt_hash = it.var:sub(2)
+  elseif it.var and it.var ~= "" then
+    local h = findNbtHash(it.name, it.damage, it.var)
     if h then fp.nbt_hash = h end
-    if type(raw.fingerprint) == "table" then
-      for k, v in pairs(raw.fingerprint) do fp[k] = v end
-    end
   end
   return fp
 end
@@ -2082,11 +2112,40 @@ local function methodsCli()
   end
 end
 
+-- диагностика: lua shop.lua avail [часть названия]
+-- печатает сырые записи me.getAvailableItems("ALL"): видно, где лежит nbt_hash
+local function avail_dump(v, ind, depth)
+  if type(v) ~= "table" then return tostring(v) end
+  if depth > 3 then return "{...}" end
+  local parts = {}
+  for k, x in pairs(v) do
+    parts[#parts + 1] = tostring(k) .. "=" .. (type(x) == "function" and "<function>" or avail_dump(x, ind, depth + 1))
+  end
+  table.sort(parts)
+  return "{" .. table.concat(parts, ", ") .. "}"
+end
+local function availCli()
+  local f = lower(ARGS[2] or "tank")
+  local ok, list = pcall(me.getAvailableItems, "ALL")
+  if not ok then print("ошибка: " .. tostring(list)); return end
+  local shown = 0
+  for _, e in pairs(list) do
+    local line = avail_dump(e, "", 0)
+    if lower(line):find(f, 1, true) then
+      print(line:sub(1, 700)); print("")
+      shown = shown + 1
+      if shown >= 4 then break end
+    end
+  end
+  if shown == 0 then print("Ничего не найдено (всего записей: " .. tostring(#list) .. ")") end
+end
+
 if ARGS[1] == "owner" then ownerCli()
 elseif ARGS[1] == "autostart" then autostartCli()
 elseif ARGS[1] == "missing" then missingCli()
 elseif ARGS[1] == "dump" then dumpCli()
 elseif ARGS[1] == "methods" then methodsCli()
+elseif ARGS[1] == "avail" then availCli()
 elseif ARGS[1] == "debug" then            -- без автоперезапуска, Ctrl+Alt+C работает
   local ok, err = xpcall(main, debug.traceback)
   if not ok then print(err) end
