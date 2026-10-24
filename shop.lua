@@ -45,6 +45,8 @@ local CONFIG = {
 
   PICK_MAX = 300,                   -- сколько предметов ME показывать в списке выбора (дальше - поиском)
 
+  MEM_LOW = 500 * 1024,             -- порог свободной ОЗУ (байт): ниже него выгружаем лишнее (см. memGuard)
+
   FEEDBACK_COOLDOWN = 30,           -- пауза между отзывами одного игрока, сек
   FEEDBACK_MAX_LEN  = 200,
   FEEDBACK_KEEP     = 100,          -- сколько последних отзывов хранить
@@ -69,6 +71,22 @@ local pim = component.pim
 local gc = function()
   if type(collectgarbage) == "function" then pcall(collectgarbage)
   else pcall(computer.freeMemory) end
+end
+
+-- Сторож памяти. Когда свободной ОЗУ меньше CONFIG.MEM_LOW, по очереди вызываются «освободители»
+-- (от дешёвых к дорогим) и после каждого проверяется, хватило ли. Освободители регистрируются
+-- ниже, рядом с тем кэшем, который они чистят. Возвращает true, если память была на исходе.
+local memReleasers = {}
+local function memGuard()
+  local okf, free = pcall(computer.freeMemory)
+  if not okf or free >= CONFIG.MEM_LOW then return false end
+  for _, release in ipairs(memReleasers) do
+    pcall(release)
+    gc()
+    local ok2, f2 = pcall(computer.freeMemory)
+    if ok2 and f2 >= CONFIG.MEM_LOW then break end
+  end
+  return true
 end
 
 -- Русские названия предметов: словарь "<id>&&<damage>" -> название (см. build_ru_from_nei.py).
@@ -134,6 +152,7 @@ do
   end
 end
 local function ruName(name, dmg, fallback) return ru.item(name, dmg, fallback) end
+memReleasers[#memReleasers + 1] = function() ru.unload() end          -- 1) словари переводов
 
 ----------------------------------------------------------------------
 -- УТИЛИТЫ
@@ -284,6 +303,7 @@ end
 local function saveDB()
   pcall(fs.makeDirectory, fs.path(CONFIG.DB_PATH))
   local tmp = CONFIG.DB_PATH .. ".tmp"
+  memGuard()                           -- serialize строит всю базу строкой: освободим место заранее
   local f = assert(io.open(tmp, "w"))
   f:write(ser.serialize(db))
   f:close()
@@ -432,6 +452,7 @@ end
 -- fname/fdmg - необязательный фильтр по одному предмету.
 -- Кэш деталей NBT-предметов ограничен по размеру и хранит только нужные поля (экономия ОЗУ).
 local detailCache, detailCount, DETAIL_MAX = {}, 0, 200
+memReleasers[#memReleasers + 1] = function() detailCache, detailCount = {}, 0 end   -- 2) детали NBT-предметов
 local function shallow(t)
   if type(t) ~= "table" then return nil end
   local r = {}
@@ -443,6 +464,7 @@ end
 -- match(f) - фильтр по fingerprint (f.id, f.dmg).
 local function taggedFromRaw(match)
   gc()                                 -- освободить память ДО тяжёлого запроса
+  memGuard()                           -- и выгрузить кэши, если ОЗУ на исходе
   local ok, raw = pcall(me.getAvailableItems)
   if not ok or type(raw) ~= "table" then return nil end
   local t = {}
@@ -544,6 +566,7 @@ local function scanME(who, full)
           local ok, part = pcall(me.getItemsInNetwork, { name = n })
           if not ok then error("ME вернула " .. tostring(part)) end
           if type(part) ~= "table" then error("ME вернула " .. tostring(part)) end
+          memGuard()
           for _, it in ipairs(part) do
             if type(it) == "table" then
               if it.hasTag then anyTag = true end
@@ -628,6 +651,7 @@ local function pickerScan(filter)
     for i = 1, #list do
       local it = list[i]
       list[i] = false                  -- отпускаем ссылку сразу, как обработали
+      if i % 64 == 0 then memGuard() end
       local name = type(it) == "table" and it.name
       if name then
         local dmg = math.floor(tonumber(it.damage) or 0)
@@ -969,6 +993,10 @@ end
 -- СОСТОЯНИЕ
 ----------------------------------------------------------------------
 local S = { player = nil }
+-- 4) список окна выбора: освобождаем, только если окно выбора сейчас не открыто
+memReleasers[#memReleasers + 1] = function()
+  if not (S.player and S.view == "pick") then cache.items = {} end
+end
 local pendingOff = false
 local running = true
 local render, nav, flash, status   -- объявлены заранее
@@ -1168,6 +1196,7 @@ local meFingerprintRaw
 -- Кэшируем только маленький результат (fingerprint одного предмета), а не весь список ME:
 -- при «Забрать всё» повторные выдачи одного и того же бака не качают getAvailableItems заново.
 local fpCache, fpCount = {}, 0
+memReleasers[#memReleasers + 1] = function() fpCache, fpCount = {}, 0 end           -- 3) отпечатки предметов
 local function meFingerprint(name, dmg, var)
   var = var or ""
   if var == "" then return { id = name, dmg = dmg } end
@@ -2206,6 +2235,7 @@ local function main()
       timeout = 0.7                                    -- анимация заставки
     end
     local e = table.pack(safePull(event.pull, timeout))
+    memGuard()                                         -- порог ОЗУ: выгрузить лишнее до обработки события
     local ok, err = xpcall(function()
       local name = e[1]
       if name == "player_on" then onPlayerOn(e)
