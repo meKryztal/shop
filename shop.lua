@@ -161,8 +161,9 @@ local function variantOf(it)
   return fluidVariant(it)
 end
 
-local function labelOf(it, var)
-  local l = ruName(it.name, it.damage, tostring(it.label or it.name))
+-- raw=true: не трогать словарь переводов (для клиентов и лёгкого скана - экономия ОЗУ)
+local function labelOf(it, var, raw)
+  local l = raw and tostring(it.label or it.name) or ruName(it.name, it.damage, tostring(it.label or it.name))
   if var and var ~= "" then
     local fl = fluidVariant(it)
     local tag
@@ -347,13 +348,18 @@ end
 local cache = { items = {}, byKey = {}, time = nil, pickMore = false, pickTotal = 0 }
 
 -- какие предметы нужны магазину: комплекты, ресурсы пополнения, неотданные покупки
-local function wantedNames()
+-- Владелец (full=true): комплекты, пополнение и покупки ВСЕХ игроков (нужно для миграции и учёта резерва).
+-- Клиент: комплекты, пополнение и только его собственные покупки - меньше предметов, меньше ОЗУ.
+local function wantedNames(who, full)
   local w = {}
   for _, k in ipairs(db.kits) do for _, it in ipairs(k.items) do w[it.name] = true end end
   for _, t in ipairs(db.topup) do w[t.name] = true end
-  for _, p in pairs(db.players) do
-    for _, pu in ipairs(p.purchases or {}) do
-      for _, it in ipairs(pu.items) do w[it.name] = true end
+  local mine = who and lower(who)
+  for key, p in pairs(db.players) do
+    if full or not mine or key == mine then
+      for _, pu in ipairs(p.purchases or {}) do
+        for _, it in ipairs(pu.items) do w[it.name] = true end
+      end
     end
   end
   return w
@@ -385,7 +391,14 @@ end
 -- например баки с жидкостью, - из getAvailableItems: там у fingerprint есть nbt_hash.
 -- Жидкость и название NBT-предмета читаем из getItemDetail (кэш по хешу).
 -- fname/fdmg - необязательный фильтр по одному предмету.
-local detailCache = {}
+-- Кэш деталей NBT-предметов ограничен по размеру и хранит только нужные поля (экономия ОЗУ).
+local detailCache, detailCount, DETAIL_MAX = {}, 0, 200
+local function shallow(t)
+  if type(t) ~= "table" then return nil end
+  local r = {}
+  for k, v in pairs(t) do if type(v) ~= "table" then r[k] = v end end
+  return r
+end
 local function meList(fname, fdmg)
   local ok, base
   if fname then ok, base = pcall(me.getItemsInNetwork, { name = fname, damage = fdmg })
@@ -393,6 +406,13 @@ local function meList(fname, fdmg)
   if not ok then return tostring(base) end
   if type(base) ~= "table" then return base end
   if me.getAvailableItems == nil then return base end
+  -- Тяжёлый getAvailableItems (полный список ME) нужен ТОЛЬКО если среди предметов есть NBT.
+  -- Нет hasTag - возвращаем лёгкий список как есть.
+  local anyTag = false
+  for _, it in ipairs(base) do
+    if type(it) == "table" and it.hasTag then anyTag = true; break end
+  end
+  if not anyTag then return base end
   local ok2, raw = pcall(me.getAvailableItems)
   if not ok2 or type(raw) ~= "table" then return base end
 
@@ -403,7 +423,7 @@ local function meList(fname, fdmg)
   for _, e in ipairs(raw) do
     local f = type(e) == "table" and e.fingerprint
     if type(f) == "table" and f.id and f.nbt_hash
-       and (not fname or (f.id == fname and math.floor(tonumber(f.dmg) or 0) == fdmg)) then
+       and (not fname or (f.id == fname and (fdmg == nil or math.floor(tonumber(f.dmg) or 0) == fdmg))) then
       local it = { name = f.id, damage = f.dmg, size = tonumber(e.qty or e.size) or 0,
                    nbt_hash = f.nbt_hash, label = f.id, maxSize = 64 }
       local d = detailCache[f.nbt_hash]
@@ -412,29 +432,69 @@ local function meList(fname, fdmg)
         if ok3 and type(det) == "table" and det.all ~= nil then
           local ok4, all = pcall(det.all); if ok4 then det = all end
         end
-        d = (ok3 and type(det) == "table") and det or false
+        d = false
+        if ok3 and type(det) == "table" then
+          local fc = shallow(det.fluid_container)
+          if fc and type(det.fluid_container.contents) == "table" then
+            fc.contents = shallow(det.fluid_container.contents)
+          end
+          d = { label = det.display_name or det.label, fluid_container = fc,
+                maxSize = tonumber(det.max_size or det.maxSize) }
+        end
+        if detailCount >= DETAIL_MAX then detailCache, detailCount = {}, 0 end
         detailCache[f.nbt_hash] = d
+        detailCount = detailCount + 1
       end
       if d then
-        it.label = d.display_name or d.label or it.label
+        it.label = d.label or it.label
         it.fluid_container = d.fluid_container
-        it.maxSize = tonumber(d.max_size or d.maxSize) or 64
+        it.maxSize = d.maxSize or 64
       end
       out[#out + 1] = it
       tagged = tagged + 1
     end
   end
+  raw = nil
   -- если NBT-предметы через getAvailableItems не нашлись, лучше вернуть всё как есть
   if tagged == 0 then return base end
   return out
 end
 
 -- Лёгкий скан при входе: запоминаем остатки только нужных предметов.
-local function scanME()
+-- who - ник игрока, full - владелец ли он (см. wantedNames).
+-- Если нужных id немного, спрашиваем ME по каждому отдельно (маленькие ответы) вместо полного
+-- списка сети. Полный список с NBT (getAvailableItems) берём только если среди ответов есть NBT-предметы.
+-- Словарь переводов здесь не нужен: названия уже лежат в записях комплектов и покупок.
+local function scanME(who, full)
   return pcall(function()
-    local list = meList()
-    if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
-    local want, by = wantedNames(), {}
+    local want, names = wantedNames(who, full), {}
+    for n in pairs(want) do names[#names + 1] = n end
+
+    local list, anyTag = {}, false
+    if #names > 0 then
+      if #names <= 40 then
+        for _, n in ipairs(names) do
+          local ok, part = pcall(me.getItemsInNetwork, { name = n })
+          if not ok then error("ME вернула " .. tostring(part)) end
+          if type(part) ~= "table" then error("ME вернула " .. tostring(part)) end
+          for _, it in ipairs(part) do
+            if type(it) == "table" then
+              if it.hasTag then anyTag = true end
+              list[#list + 1] = it
+            end
+          end
+        end
+        if anyTag then                       -- есть NBT-предметы: один раз берём полный список с хешами
+          list = meList()
+          if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
+        end
+      else
+        list = meList()
+        if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
+      end
+    end
+
+    local by = {}
     for _, it in ipairs(list) do
       local name = type(it) == "table" and it.name
       if name and want[name] then
@@ -446,13 +506,14 @@ local function scanME()
         if e then e.size = e.size + size
         else
           by[k] = { key = k, name = name, damage = dmg, var = var, fluid = fluidVariant(it),
-                    label = labelOf(it, var), size = size, maxSize = tonumber(it.maxSize) or 64 }
+                    label = labelOf(it, var, true), size = size, maxSize = tonumber(it.maxSize) or 64 }
         end
       end
     end
     list = nil
     migrateVariants(by)
     cache.byKey, cache.time = by, computer.uptime()
+    collectgarbage()
   end)
 end
 
@@ -499,13 +560,20 @@ local function pickerScan(filter)
         end
       end
     end
-    list = nil
+    list, seen = nil, nil
     table.sort(out, function(a, b)
       if a[3] ~= b[3] then return a[3] < b[3] end
       if a[1] ~= b[1] then return a[1] < b[1] end
       return a[2] < b[2]
     end)
-    cache.items, cache.pickTotal, cache.pickMore = out, #out, false
+    -- показываем не больше CONFIG.PICK_MAX первых по алфавиту; остальное - через поиск
+    local total, more = #out, false
+    if total > CONFIG.PICK_MAX then
+      for i = total, CONFIG.PICK_MAX + 1, -1 do out[i] = nil end
+      more = true
+    end
+    cache.items, cache.pickTotal, cache.pickMore = out, total, more
+    collectgarbage()
   end)
 end
 -- точный запрос по одному предмету (дёшево, используется при покупке/выдаче)
@@ -950,10 +1018,18 @@ end
 local function verifyStock(kit)
   local res = reservedMap()
   for _, it in ipairs(kit.items) do
-    local real = meCount(it.name, it.damage, it.var)
-    if real == nil then return false, "ME-сеть недоступна. Попробуйте позже." end
     local k = itemKey(it.name, it.damage, it.var)
-    if cache.byKey[k] then cache.byKey[k].size = real end
+    local real
+    if (it.var or "") == "" then
+      -- обычный предмет: точный лёгкий запрос по одному id (без getAvailableItems)
+      real = meCount(it.name, it.damage, it.var)
+      if real == nil then return false, "ME-сеть недоступна. Попробуйте позже." end
+      if cache.byKey[k] then cache.byKey[k].size = real end
+    else
+      -- NBT-предмет: точный запрос требует полного списка ME (дорого по ОЗУ),
+      -- поэтому берём остаток из кэша; реальное наличие всё равно проверит doClaim при выдаче
+      real = cache.byKey[k] and cache.byKey[k].size or 0
+    end
     if real - (res[k] or 0) < it.qty then
       return false, "Комплект только что закончился: не хватает «" .. it.label .. "»."
     end
@@ -990,9 +1066,30 @@ end
 -- бак с жидкостью), ищем хеш среди предметов сети: перебираем getAvailableItems() с тем же id+dmg
 -- и сравниваем жидкость в getItemDetail() с нужной.
 local lastExportErr
+local meFingerprintRaw
+-- Кэшируем только маленький результат (fingerprint одного предмета), а не весь список ME:
+-- при «Забрать всё» повторные выдачи одного и того же бака не качают getAvailableItems заново.
+local fpCache, fpCount = {}, 0
 local function meFingerprint(name, dmg, var)
   var = var or ""
   if var == "" then return { id = name, dmg = dmg } end
+  local ck = name .. "&&" .. dmg .. "&&" .. var
+  local c = fpCache[ck]
+  if c then return { id = c.id, dmg = c.dmg, nbt_hash = c.nbt_hash } end
+  local f, err = meFingerprintRaw(name, dmg, var)
+  if f then
+    if fpCount >= 100 then fpCache, fpCount = {}, 0 end
+    fpCache[ck] = { id = f.id, dmg = f.dmg, nbt_hash = f.nbt_hash }
+    fpCount = fpCount + 1
+  end
+  return f, err
+end
+
+meFingerprintRaw = function(name, dmg, var)
+  var = var or ""
+  if var == "" then return { id = name, dmg = dmg } end
+  -- если хеш известен, getAvailableItems не нужен вообще
+  if var:sub(1, 1) == "#" then return { id = name, dmg = dmg, nbt_hash = var:sub(2) } end
   local ok, list = pcall(me.getAvailableItems)
   if not ok or type(list) ~= "table" then
     if var:sub(1, 1) == "#" then return { id = name, dmg = dmg, nbt_hash = var:sub(2) } end
@@ -1183,7 +1280,7 @@ end
 local function doRefresh()
   if refreshRemaining() > 0 then return end
   status("Сканирую ME-сеть...")
-  local ok, err = scanME()
+  local ok, err = scanME(S.player and S.player.name, S.player and S.player.owner)
   if ok and S.player and S.player.owner and S.view == "pick" then
     if S.pickSource == "inv" then ok, err = invPickerScan(S.filter)
     else ok, err = pickerScan(S.filter) end
@@ -1401,6 +1498,7 @@ end
 local function switchTab(t)
   S.tab = t; S.view = "list"; S.csub = "kits"; S.page = 1
   S.msg = ""; S.confirm = nil; S.filter = ""
+  if #cache.items > 0 then cache.items = {}; ru.unload() end     -- ушли из окна выбора: освобождаем
   if t == "topup" then scanInventory() end
   render()
 end
@@ -1594,6 +1692,7 @@ local function renameEntry(entry)
     local c = cache.byKey[itemKey(entry.name, entry.damage, entry.var)]
     entry.label = ruName(entry.name, entry.damage, (c and c.label) or entry.label)
     entry.customLabel = nil
+    ru.unload()
   else
     entry.label = nm
     entry.customLabel = true
@@ -1745,6 +1844,7 @@ local function screenPick()
   end
   S.backFn = function()
     cache.items = {}                       -- освобождаем память
+    ru.unload()                            -- и словарь переводов (нужен только владельцу в этом окне)
     if S.pickMode == "kit" then nav({ view = "edit", filter = "" })
     else nav({ view = "list", csub = "topup", filter = "" }) end
   end
@@ -1878,7 +1978,7 @@ local function onPlayerOn(e)
 
   local p = getPlayer(S.player.name)
   purgePurchases(p)
-  local ok, err = scanME()                 -- единственное "тяжёлое" сканирование на входе
+  local ok, err = scanME(S.player.name, S.player.owner)   -- единственное сканирование на входе
   render()
   if not ok then
     -- технический текст ошибки видит только владелец
@@ -1890,9 +1990,16 @@ local function onPlayerOn(e)
   end
 end
 
+-- Игрок ушёл с PIM: выгружаем всё, что нужно только на время сеанса.
+-- В простое магазин держит в ОЗУ только базу; остатки ME и словари загрузятся заново при следующем входе.
 local function onPlayerOff()
   S = { player = nil }
-  cache.items = {}
+  cache.items, cache.byKey, cache.time = {}, {}, nil
+  cache.pickMore, cache.pickTotal = false, 0
+  detailCache, detailCount = {}, 0
+  fpCache, fpCount = {}, 0
+  ru.unload()
+  collectgarbage()
   render()
 end
 
@@ -1911,6 +2018,12 @@ end
 local lastAutoReport = -100
 local function reportError(err)
   err = tostring(err)
+  local oom = err:lower():find("memory", 1, true) ~= nil
+  collectgarbage()
+  pcall(function()
+    err = err .. " [free " .. math.floor(computer.freeMemory() / 1024) .. "K/" ..
+          math.floor(computer.totalMemory() / 1024) .. "K]"
+  end)
   UI.oy = 0
   local f = io.open(CONFIG.LOG_PATH, "a")
   if f then f:write(tostring(os.time()) .. " " .. err .. "\n"); f:close() end
@@ -1923,7 +2036,8 @@ local function reportError(err)
   if S.player then
     S.msg = "Внутренняя ошибка (записана для владельца)."; S.msgOk = false
     pcall(render)
-    if S.player.owner then   -- владельцу показываем настоящий текст
+    -- при нехватке памяти окно с ошибкой не строим: оно само требует памяти (текст всё равно в «Отзывах»)
+    if S.player.owner and not oom then   -- владельцу показываем настоящий текст
       pcall(modal, "Ошибка (видно только владельцу)", err:sub(1, 600))
       pcall(render)
     end
@@ -1949,6 +2063,7 @@ local function main()
     end
     pcall(saveDB)
   end
+  ru.unload()          -- словарь нужен был только для этого перевода; дальше грузится лениво, у владельца
   if #CONFIG.OWNERS == 0 and #db.owners == 0 then
     print("ВНИМАНИЕ: владелец не задан. Остановите программу и выполните:")
     print("  lua kitshop.lua owner add ВашНик")
@@ -2141,10 +2256,22 @@ end
 -- Надзиратель: при любой неожиданной ошибке магазин перезапускается,
 -- а не падает в консоль (к которой мог бы получить доступ игрок).
 local function supervised()
+  local fails = 0
   while running do
     local ok, err = xpcall(main, debug.traceback)
-    if not ok then
+    if ok then
+      fails = 0
+    else
+      fails = fails + 1
       pcall(reportError, err)
+      if fails >= 5 then
+        -- 5 падений подряд: перезапуск main не помогает. Полная перезагрузка ПК освобождает
+        -- всю память, а автозапуск (.shrc) поднимет магазин заново. В консоль не выходим.
+        pcall(computer.shutdown, true)
+        os.sleep(5)
+        return
+      end
+      collectgarbage()
       os.sleep(3)
     end
   end
