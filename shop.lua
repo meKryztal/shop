@@ -261,17 +261,21 @@ local function defaultDB()
 end
 
 local function loadDB()
-  if fs.exists(CONFIG.DB_PATH) then
-    local f = io.open(CONFIG.DB_PATH, "r")
-    if f then
-      local data = f:read("*a"); f:close()
-      local t = ser.unserialize(data)
-      if type(t) == "table" then
-        for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
-        return t
+  -- основной файл, а если он пропал (сбой между remove и rename в saveDB) - временный
+  for _, path in ipairs({ CONFIG.DB_PATH, CONFIG.DB_PATH .. ".tmp" }) do
+    if fs.exists(path) then
+      local f = io.open(path, "r")
+      if f then
+        local data = f:read("*a"); f:close()
+        local t = ser.unserialize(data)
+        data = nil
+        if type(t) == "table" then
+          for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
+          return t
+        end
+        -- файл повреждён: не затираем, а откладываем в сторону
+        pcall(fs.copy, path, path .. ".bad")
       end
-      -- файл повреждён: не затираем, а откладываем в сторону
-      pcall(fs.copy, CONFIG.DB_PATH, CONFIG.DB_PATH .. ".bad")
     end
   end
   return defaultDB()
@@ -438,6 +442,7 @@ end
 -- а сам огромный список сразу отпускаем: он не должен жить одновременно с getItemsInNetwork.
 -- match(f) - фильтр по fingerprint (f.id, f.dmg).
 local function taggedFromRaw(match)
+  gc()                                 -- освободить память ДО тяжёлого запроса
   local ok, raw = pcall(me.getAvailableItems)
   if not ok or type(raw) ~= "table" then return nil end
   local t = {}
@@ -449,6 +454,8 @@ local function taggedFromRaw(match)
       t[#t + 1] = { fp = fp, qty = tonumber(e.qty or e.size) or 0 }
     end
   end
+  raw = nil
+  gc()                                 -- огромный список больше не нужен
   return t
 end
 
@@ -532,7 +539,7 @@ local function scanME(who, full)
 
     local list, anyTag = {}, false
     if #names > 0 then
-      if #names <= 40 then
+      if #names <= 200 then          -- по одному id (маленькие ответы); полный список сети - только в крайнем случае
         for _, n in ipairs(names) do
           local ok, part = pcall(me.getItemsInNetwork, { name = n })
           if not ok then error("ME вернула " .. tostring(part)) end
@@ -611,31 +618,42 @@ local function pickerScan(filter)
 
     -- В памяти держим не все предметы ME, а только PICK_MAX первых по алфавиту:
     -- копим буфер и, когда он вырос вдвое, сортируем и обрезаем.
+    -- Без поискового запроса список уже отсортирован по id, поэтому первые K записей известны сразу:
+    -- название (а с ним словарь перевода) считаем только для них, а не для всех предметов сети.
+    -- С запросом название нужно каждому предмету (по нему идёт поиск).
     local K = CONFIG.PICK_MAX
     local buf, total = {}, 0
-    local prevKey, prevEntry
+    local pName, pDmg, pVar, prevEntry
+    local searching = #words > 0
     for i = 1, #list do
       local it = list[i]
       list[i] = false                  -- отпускаем ссылку сразу, как обработали
       local name = type(it) == "table" and it.name
       if name then
+        local dmg = math.floor(tonumber(it.damage) or 0)
         local var = variantOf(it)
-        local label = labelOf(it, var)
-        local match = true
-        if #words > 0 then
+        if name == pName and dmg == pDmg and var == pVar then
+          -- тот же предмет подряд (несколько стеков): складываем количество
+          if prevEntry then prevEntry[4] = prevEntry[4] + (tonumber(it.size) or 0) end
+        elseif not searching then
+          pName, pDmg, pVar = name, dmg, var
+          total = total + 1
+          if #buf < K then
+            prevEntry = { name, dmg, labelOf(it, var), tonumber(it.size) or 0, tonumber(it.maxSize) or 64, var }
+            buf[#buf + 1] = prevEntry
+          else
+            prevEntry = nil
+          end
+        else
+          local label = labelOf(it, var)
           local hay = searchNorm(label .. " " .. tostring(it.label) .. " " .. name)
+          local match = true
           for _, w in ipairs(words) do
             if not hay:find(w, 1, true) then match = false; break end
           end
-        end
-        if match then
-          local dmg = math.floor(tonumber(it.damage) or 0)
-          local k = itemKey(name, dmg, var)
-          if k == prevKey then           -- тот же предмет подряд (несколько стеков): складываем количество
-            prevEntry[4] = prevEntry[4] + (tonumber(it.size) or 0)
-          else
+          if match then
             local e = { name, dmg, label, tonumber(it.size) or 0, tonumber(it.maxSize) or 64, var }
-            prevKey, prevEntry = k, e
+            pName, pDmg, pVar, prevEntry = name, dmg, var, e
             total = total + 1
             buf[#buf + 1] = e
             if #buf >= K * 2 then
@@ -1050,8 +1068,10 @@ end
 local function askNumber(title, initial, integer)
   local s = prompt(title, initial and tostring(initial) or "", 12)
   if not s then return nil end
-  local n = tonumber((s:gsub(",", ".")))
-  if not n or n ~= n or n < 0 then return nil end
+  s = trim((s:gsub(",", ".")))
+  if not s:match("^%d+%.?%d*$") then return nil end     -- только обычная запись: без 0x10, 1e300, inf
+  local n = tonumber(s)
+  if not n or n ~= n or n < 0 or n > 10000000 then return nil end
   if integer then n = math.floor(n) end
   return n
 end
@@ -2027,7 +2047,7 @@ render = function()
   end)
   UI.oy = 0
   if not ok then error(err, 0) end
-  drawFooter()
+  UI.tag = "foot"; drawFooter(); UI.tag = nil   -- с тегом, чтобы redrawFooter не плодил дубли кнопок
 end
 
 ----------------------------------------------------------------------
@@ -2104,8 +2124,10 @@ local function reportError(err)
           math.floor(computer.totalMemory() / 1024) .. "K]"
   end)
   UI.oy = 0
-  local f = io.open(CONFIG.LOG_PATH, "a")
-  if f then f:write(tostring(os.time()) .. " " .. err .. "\n"); f:close() end
+  -- лог не должен разрастаться: больше 100 КБ - начинаем заново
+  local okSize, logSize = pcall(fs.size, CONFIG.LOG_PATH)
+  local f = io.open(CONFIG.LOG_PATH, (okSize and (tonumber(logSize) or 0) > 102400) and "w" or "a")
+  if f then f:write(tostring(os.time()) .. " " .. err:sub(1, 2000) .. "\n"); f:close() end
   local now = computer.uptime()
   if db and now - lastAutoReport > 10 then
     lastAutoReport = now
@@ -2126,23 +2148,39 @@ end
 ----------------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------------
+local startupPrepared = false     -- подготовку базы делаем один раз за запуск, а не при каждом перезапуске main
 local function main()
   db = loadDB()
-  -- переводим уже сохранённые названия (комплекты, пополнение, незабранные покупки)
-  do
-    local function tr(list)
-      for _, x in ipairs(list) do
-        if not x.customLabel then x.label = ruName(x.name, x.damage, x.label) end
+  if not startupPrepared then
+    startupPrepared = true
+    -- переводим уже сохранённые названия (комплекты, пополнение, незабранные покупки).
+    -- Записи собираем в один массив и сортируем по id предмета: файл словаря каждого мода
+    -- читается один раз (раньше они грузились по кругу из-за SHARD_KEEP) - это и тормозило запуск.
+    do
+      local all = {}
+      local function grab(list)
+        for _, x in ipairs(list) do if not x.customLabel then all[#all + 1] = x end end
       end
+      for _, k in ipairs(db.kits) do grab(k.items) end
+      grab(db.topup)
+      for _, p in pairs(db.players) do
+        for _, pu in ipairs(p.purchases or {}) do grab(pu.items) end
+      end
+      table.sort(all, function(a, b) return tostring(a.name) < tostring(b.name) end)
+      for _, x in ipairs(all) do x.label = ruName(x.name, x.damage, x.label) end
+      all = nil
     end
-    for _, k in ipairs(db.kits) do tr(k.items) end
-    tr(db.topup)
-    for _, p in pairs(db.players) do
-      for _, pu in ipairs(p.purchases or {}) do tr(pu.items) end
+    -- чистим игроков без баланса и без покупок: они только раздувают базу (создаются заново при входе)
+    do
+      local drop = {}
+      for key, p in pairs(db.players) do
+        if (tonumber(p.balance) or 0) <= 0 and #(p.purchases or {}) == 0 then drop[#drop + 1] = key end
+      end
+      for _, key in ipairs(drop) do db.players[key] = nil end
     end
     pcall(saveDB)
+    ru.unload()        -- словарь нужен был только для этого перевода; дальше грузится лениво, у владельца
   end
-  ru.unload()          -- словарь нужен был только для этого перевода; дальше грузится лениво, у владельца
   if #CONFIG.OWNERS == 0 and #db.owners == 0 then
     print("ВНИМАНИЕ: владелец не задан. Остановите программу и выполните:")
     print("  lua kitshop.lua owner add ВашНик")
