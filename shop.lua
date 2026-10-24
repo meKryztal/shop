@@ -276,7 +276,7 @@ end
 local db
 
 local function defaultDB()
-  return { owners = {}, ownerUids = {}, kits = {}, nextKitId = 1, topup = {}, players = {}, feedback = {}, nextPurchaseId = 1 }
+  return { owners = {}, ownerUids = {}, kits = {}, nextKitId = 1, topup = {}, players = {}, feedback = {}, nextPurchaseId = 1, withdraw = false }
 end
 
 local function loadDB()
@@ -413,6 +413,7 @@ local function wantedNames(who, full)
   local w = {}
   for _, k in ipairs(db.kits) do for _, it in ipairs(k.items) do w[it.name] = true end end
   for _, t in ipairs(db.topup) do w[t.name] = true end
+  if db.withdraw then w[db.withdraw.name] = true end
   local mine = who and lower(who)
   for key, p in pairs(db.players) do
     if full or not mine or key == mine then
@@ -439,6 +440,7 @@ local function migrateVariants(by)
   end
   for _, k in ipairs(db.kits) do for _, it in ipairs(k.items) do fix(it) end end
   for _, t in ipairs(db.topup) do fix(t) end
+  if db.withdraw then fix(db.withdraw) end
   for _, p in pairs(db.players) do
     for _, pu in ipairs(p.purchases or {}) do for _, it in ipairs(pu.items) do fix(it) end end
   end
@@ -1450,6 +1452,139 @@ local function sendFeedback()
 end
 
 ----------------------------------------------------------------------
+-- ВЫВОД: баланс -> один предмет, заданный владельцем (db.withdraw)
+----------------------------------------------------------------------
+-- сколько штук игрок может вывести прямо сейчас: баланс, место в инвентаре, остаток в ME
+local function withdrawMax()
+  local w = db.withdraw
+  local p = getPlayer(S.player.name)
+  local byBal = math.floor(round2(p.balance) / w.price + 1e-9)
+  if byBal <= 0 then return 0, "Не хватает средств на балансе даже на 1 шт." end
+  local key = itemKey(w.name, w.damage, w.var)
+  local mx = (cache.byKey[key] and cache.byKey[key].maxSize) or 64
+  local space = spaceIn(readSlots(), w.name, w.damage, mx, w.var)
+  if space <= 0 then return 0, "Нет места в инвентаре." end
+  local real = meCount(w.name, w.damage, w.var)
+  if real == nil then return nil, "ME-сеть недоступна." end
+  local avail = real - (reservedMap()[key] or 0)
+  if avail <= 0 then return 0, "Предмета сейчас нет в ME." end
+  return math.max(0, math.min(byBal, space, avail))
+end
+
+-- окно вывода: возвращает количество или nil (отмена)
+local function withdrawDialog()
+  local w = db.withdraw
+  local bw, bh = math.min(W - 4, 70), 13
+  local bx, by = math.floor((W - bw) / 2) + 1, math.floor((H - bh) / 2) + 1
+  local mw = 12
+  local fw = bw - 4 - mw - 1
+  local buf, err = "", nil
+  local function qty() return tonumber(buf) or 0 end
+  local function draw()
+    local p = getPlayer(S.player.name)
+    fill(bx, by, bw, bh, C.dlg)
+    frame(bx, by, bw, bh, C.gold, C.dlg)
+    text(bx + 2, by + 1, pad("Вывод: " .. w.label, bw - 6 - CROSS_W), C.gold, C.dlg)
+    drawCross(bx, by, bw)
+    text(bx + 2, by + 3, pad("Цена: " .. fmt(w.price) .. " " .. CONFIG.CURRENCY .. " за шт     Баланс: " ..
+         fmt(p.balance) .. " " .. CONFIG.CURRENCY, bw - 4), C.text, C.dlg)
+    text(bx + 2, by + 4, pad("Сколько штук вывести:", bw - 4), C.dim, C.dlg)
+    frame(bx + 2, by + 5, fw, 3, C.dim, C.dlg)
+    fill(bx + 3, by + 6, fw - 2, 1, 0x000000)
+    local shown = buf
+    if unicode.len(shown) > fw - 4 then shown = unicode.sub(shown, unicode.len(shown) - fw + 5) end
+    text(bx + 3, by + 6, shown .. "_", C.accent, 0x000000)
+    fill(bx + bw - 2 - mw, by + 5, mw, 3, C.blue)
+    text(bx + bw - 2 - mw + math.floor((mw - 3) / 2), by + 6, "MAX", 0xffffff, C.blue)
+    if err then text(bx + 2, by + 8, pad(err, bw - 4), C.red, C.dlg)
+    else text(bx + 2, by + 8, pad("К списанию: " .. fmt(qty() * w.price) .. " " .. CONFIG.CURRENCY, bw - 4), C.gold, C.dlg) end
+    fill(bx + 2, by + 9, bw - 4, 3, C.tabOn)
+    text(bx + 2 + math.floor((bw - 4 - 7) / 2), by + 10, "Вывести", 0xffffff, C.tabOn)
+  end
+  local function submit()
+    if qty() < 1 then err = "Введите количество больше нуля."; draw(); return nil end
+    return qty()
+  end
+  draw()
+  while true do
+    local e = table.pack(safePull(event.pullMultiple, "key_down", "touch", "player_off"))
+    if e[1] == "player_off" then pendingOff = true; return nil end
+    local who = (e[1] == "touch") and e[6] or e[5]
+    if not who or not S.player or lower(who) == lower(S.player.name) then
+      if e[1] == "touch" then
+        local x, y = e[3], e[4]
+        if type(x) == "number" and type(y) == "number" then
+          if hitCross(e, bx, by, bw) then return nil end
+          if x >= bx + bw - 2 - mw and x <= bx + bw - 3 and y >= by + 5 and y <= by + 7 then
+            local m, why = withdrawMax()
+            if m == nil or m <= 0 then buf = ""; err = why or "Вывести нечего."
+            else buf = tostring(m); err = nil end
+            draw()
+          elseif x >= bx + 2 and x <= bx + bw - 3 and y >= by + 9 and y <= by + 11 then
+            local q = submit(); if q then return q end
+          end
+        end
+      else
+        local ch, code = e[3], e[4]
+        if code == 28 or code == 156 or ch == 13 then
+          local q = submit(); if q then return q end
+        elseif code == 1 then return nil
+        elseif code == 14 or ch == 8 then
+          buf = unicode.sub(buf, 1, math.max(0, unicode.len(buf) - 1)); err = nil; draw()
+        elseif ch and ch >= 48 and ch <= 57 and unicode.len(buf) < 7 then
+          buf = buf .. unicode.char(ch); err = nil; draw()
+        end
+      end
+    end
+  end
+end
+
+local function doWithdraw(q)
+  local w = db.withdraw
+  if not w then return flash("Вывод не настроен владельцем.", false) end
+  if not q or q < 1 then return render() end
+  local p = getPlayer(S.player.name)
+  local cost = round2(q * w.price)
+  if round2(p.balance) < cost then
+    return flash("Не хватает средств: нужно " .. fmt(cost) .. ", на балансе " .. fmt(p.balance) .. ".", false)
+  end
+  status("Проверяю наличие в ME...")
+  local real = meCount(w.name, w.damage, w.var)
+  if real == nil then return flash("ME-сеть недоступна. Попробуйте позже.", false) end
+  local k = itemKey(w.name, w.damage, w.var)
+  if real - (reservedMap()[k] or 0) < q then
+    return flash("В ME недостаточно предмета для вывода.", false)
+  end
+
+  -- списываем баланс и оформляем выдачу как покупку (дальше работает обычная надёжная выдача)
+  p.balance = round2(p.balance - cost)
+  local it = { name = w.name, damage = w.damage, var = w.var, label = w.label,
+               customLabel = w.customLabel, qty = q }
+  local pu = { id = db.nextPurchaseId, kit = "Вывод", items = { it } }
+  db.nextPurchaseId = db.nextPurchaseId + 1
+  p.purchases[#p.purchases + 1] = pu
+  saveDB()
+
+  doClaim(pu, it, true)
+  local left = it.qty
+  purgePurchases(p)
+  if left <= 0 then
+    flash("Выведено: " .. w.label .. " x" .. q .. ". Списано: " .. fmt(cost) .. " " .. CONFIG.CURRENCY, true)
+  else
+    flash("Выдано " .. (q - left) .. " из " .. q .. ". Остаток ждёт в «Незабранное» (освободите место).", true)
+  end
+end
+
+local function openWithdraw()
+  if not db.withdraw then
+    return flash("Вывод пока не настроен владельцем.", false)
+  end
+  local q = withdrawDialog()
+  if pendingOff then return end
+  if q then doWithdraw(q) else render() end
+end
+
+----------------------------------------------------------------------
 -- ЭКРАНЫ
 ----------------------------------------------------------------------
 -- сколько карточек влезает: от строки y0 до подвала, шаг 4 (3 строки + пропуск)
@@ -1635,8 +1770,9 @@ local function drawHeader()
   local bal = "Баланс: " .. fmt(getPlayer(S.player.name).balance) .. " " .. CONFIG.CURRENCY
   local balW = unicode.len(bal)
   text(W - balW, 1, bal, C.gold, C.bar)
+  addBtn(W - balW - 10, 1, 8, 1, "Вывод", { bg = db.withdraw and C.tabOn or C.panel2, fg = 0xffffff, fn = openWithdraw })
   local who = S.player.name .. (S.player.owner and " [владелец]" or "")
-  text(20, 1, pad(who, math.max(1, W - balW - 22)), C.text, C.bar)
+  text(20, 1, pad(who, math.max(1, W - balW - 32)), C.text, C.bar)
 
   local tabs = { { "kits", "Квесты/Комплекты" }, { "topup", "Пополнение" } }
   if S.player.owner then tabs[#tabs + 1] = { "create", "Создание" } end
@@ -1792,11 +1928,11 @@ end
 ---------------------------------------------------------- вкладка: создание (владелец)
 local function subBar()
   local unread = unreadFeedback()
-  local subs = { { "kits", "Комплекты" }, { "topup", "Ресурсы пополнения" },
+  local subs = { { "kits", "Комплекты" }, { "topup", "Ресурсы пополнения" }, { "withdraw", "Вывод" },
                  { "feedback", "Отзывы" .. (unread > 0 and (" (" .. unread .. ")") or "") } }
   local exitW, gap = 14, 1
   local region = (W - 2) - exitW - gap            -- ширина под три вкладки (колонки 2 .. W-1-exitW-gap)
-  local bw = math.floor((region - gap * 2) / 3)
+  local bw = math.floor((region - gap * 3) / 4)
   for i, s in ipairs(subs) do
     local on = (S.csub == s[1])
     addBtn(2 + (i - 1) * (bw + gap), 6, bw, 3, s[2],
@@ -1919,6 +2055,12 @@ local function pickItem(e)
     if not found then kit.items[#kit.items + 1] = { name = name, damage = dmg, var = var, label = label, qty = q } end
     saveDB()
     flash("Добавлено: " .. label .. " x" .. q .. ". Выберите ещё или нажмите «Назад».", true)
+  elseif S.pickMode == "withdraw" then
+    local price = askPrice("Цена вывода за 1 шт «" .. label .. "» [" .. name .. ":" .. dmg .. "] (" .. CONFIG.CURRENCY .. "):", "1")
+    if not price then return render() end
+    db.withdraw = { name = name, damage = dmg, var = var, label = label, price = round2(price) }
+    saveDB()
+    flash("Предмет вывода сохранён: " .. label .. " по " .. fmt(price), true)
   else
     local price = askPrice("Цена за 1 шт «" .. label .. "» [" .. name .. ":" .. dmg .. "] (" .. CONFIG.CURRENCY .. "):", "1")
     if not price then return render() end
@@ -1974,6 +2116,7 @@ local function screenPick()
     cache.items = {}                       -- освобождаем память
     ru.unload()                            -- и словарь переводов (нужен только владельцу в этом окне)
     if S.pickMode == "kit" then nav({ view = "edit", filter = "" })
+    elseif S.pickMode == "withdraw" then nav({ view = "list", csub = "withdraw", filter = "" })
     else nav({ view = "list", csub = "topup", filter = "" }) end
   end
 end
@@ -2023,6 +2166,26 @@ local function screenCreate()
       rb(y, off, BW2, "Цена", { fn = function()
         local v = askPrice("Новая цена за 1 шт «" .. e.label .. "»:", fmt(e.price))
         if v then e.price = round2(v); saveDB() end
+        render()
+      end })
+    end
+
+  elseif S.csub == "withdraw" then
+    addBtn(2, 10, 28, 3, "+ Выбрать (ME)", { bg = C.tabOn, fn = function() openPicker("withdraw", "me") end })
+    addBtn(30, 10, 28, 3, "+ Из инвентаря", { bg = C.blue, fn = function() openPicker("withdraw", "inv") end })
+    text(60, 11, "Единственный предмет, который игроки могут вывести за баланс.", C.dim, C.bg)
+    local w = db.withdraw
+    if not w then
+      text(2, SUB_Y, "Предмет вывода не задан.", C.dim, C.bg)
+    else
+      local reserve = BW2 * 2 + 1 + 2
+      lineCard(SUB_Y, w.label .. " [" .. w.name .. ":" .. w.damage .. "]",
+               "Цена за 1 шт: " .. fmt(w.price) .. " " .. CONFIG.CURRENCY, C.text, reserve,
+               function() renameEntry(w) end)
+      local off = rb(SUB_Y, 0, BW2, "Убрать", { fn = function() db.withdraw = false; saveDB(); render() end })
+      rb(SUB_Y, off, BW2, "Цена", { fn = function()
+        local v = askPrice("Новая цена вывода за 1 шт «" .. w.label .. "»:", fmt(w.price))
+        if v then w.price = round2(v); saveDB() end
         render()
       end })
     end
@@ -2192,6 +2355,7 @@ local function main()
       end
       for _, k in ipairs(db.kits) do grab(k.items) end
       grab(db.topup)
+      if db.withdraw then grab({ db.withdraw }) end
       for _, p in pairs(db.players) do
         for _, pu in ipairs(p.purchases or {}) do grab(pu.items) end
       end
