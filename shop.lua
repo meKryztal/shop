@@ -63,10 +63,12 @@ local gpu = component.gpu
 local me  = component.me_interface
 local pim = component.pim
 
--- В OpenComputers функции collectgarbage может не быть: вызываем её только если она есть.
--- Сборка мусора там и так идёт автоматически, это лишь необязательная подстраховка.
+-- Принудительная сборка мусора. В OpenComputers функции collectgarbage может не быть,
+-- зато вызов computer.freeMemory() запускает сборку мусора (так её и принято вызывать).
+-- Всё под pcall: если ничего не сработает, магазин просто продолжит работу.
 local gc = function()
-  if type(collectgarbage) == "function" then pcall(collectgarbage) end
+  if type(collectgarbage) == "function" then pcall(collectgarbage)
+  else pcall(computer.freeMemory) end
 end
 
 -- Русские названия предметов: словарь "<id>&&<damage>" -> название (см. build_ru_from_nei.py).
@@ -432,65 +434,90 @@ local function shallow(t)
   for k, v in pairs(t) do if type(v) ~= "table" then r[k] = v end end
   return r
 end
-local function meList(fname, fdmg)
-  local ok, base
-  if fname then ok, base = pcall(me.getItemsInNetwork, { name = fname, damage = fdmg })
-  else ok, base = pcall(me.getItemsInNetwork) end
-  if not ok then return tostring(base) end
-  if type(base) ~= "table" then return base end
-  if me.getAvailableItems == nil then return base end
-  -- Тяжёлый getAvailableItems (полный список ME) нужен ТОЛЬКО если среди предметов есть NBT.
-  -- Нет hasTag - возвращаем лёгкий список как есть.
-  local anyTag = false
-  for _, it in ipairs(base) do
-    if type(it) == "table" and it.hasTag then anyTag = true; break end
+-- Из полного списка getAvailableItems берём ТОЛЬКО NBT-предметы (маленькая таблица),
+-- а сам огромный список сразу отпускаем: он не должен жить одновременно с getItemsInNetwork.
+-- match(f) - фильтр по fingerprint (f.id, f.dmg).
+local function taggedFromRaw(match)
+  local ok, raw = pcall(me.getAvailableItems)
+  if not ok or type(raw) ~= "table" then return nil end
+  local t = {}
+  for _, e in ipairs(raw) do
+    local f = type(e) == "table" and e.fingerprint
+    if type(f) == "table" and f.id and f.nbt_hash and match(f) then
+      local fp = {}
+      for k, v in pairs(f) do fp[k] = v end
+      t[#t + 1] = { fp = fp, qty = tonumber(e.qty or e.size) or 0 }
+    end
   end
-  if not anyTag then return base end
-  local ok2, raw = pcall(me.getAvailableItems)
-  if not ok2 or type(raw) ~= "table" then return base end
+  return t
+end
 
-  local out, tagged = {}, 0
+-- Склеивает обычные предметы из base (без hasTag) и NBT-предметы из tagged (с деталями из кэша).
+-- Нет NBT-предметов - возвращает base как есть.
+local function mergeTagged(base, tagged)
+  if not tagged or #tagged == 0 then return base end
+  local out = {}
   for _, it in ipairs(base) do
     if type(it) == "table" and not it.hasTag then out[#out + 1] = it end
   end
-  for _, e in ipairs(raw) do
-    local f = type(e) == "table" and e.fingerprint
-    if type(f) == "table" and f.id and f.nbt_hash
-       and (not fname or (f.id == fname and (fdmg == nil or math.floor(tonumber(f.dmg) or 0) == fdmg))) then
-      local it = { name = f.id, damage = f.dmg, size = tonumber(e.qty or e.size) or 0,
-                   nbt_hash = f.nbt_hash, label = f.id, maxSize = 64 }
-      local d = detailCache[f.nbt_hash]
-      if d == nil then
-        local ok3, det = pcall(me.getItemDetail, f)
-        if ok3 and type(det) == "table" and det.all ~= nil then
-          local ok4, all = pcall(det.all); if ok4 then det = all end
-        end
-        d = false
-        if ok3 and type(det) == "table" then
-          local fc = shallow(det.fluid_container)
-          if fc and type(det.fluid_container.contents) == "table" then
-            fc.contents = shallow(det.fluid_container.contents)
-          end
-          d = { label = det.display_name or det.label, fluid_container = fc,
-                maxSize = tonumber(det.max_size or det.maxSize) }
-        end
-        if detailCount >= DETAIL_MAX then detailCache, detailCount = {}, 0 end
-        detailCache[f.nbt_hash] = d
-        detailCount = detailCount + 1
+  for _, e in ipairs(tagged) do
+    local f = e.fp
+    local it = { name = f.id, damage = f.dmg, size = e.qty,
+                 nbt_hash = f.nbt_hash, label = f.id, maxSize = 64 }
+    local d = detailCache[f.nbt_hash]
+    if d == nil then
+      local ok3, det = pcall(me.getItemDetail, f)
+      if ok3 and type(det) == "table" and det.all ~= nil then
+        local ok4, all = pcall(det.all); if ok4 then det = all end
       end
-      if d then
-        it.label = d.label or it.label
-        it.fluid_container = d.fluid_container
-        it.maxSize = d.maxSize or 64
+      d = false
+      if ok3 and type(det) == "table" then
+        local fc = shallow(det.fluid_container)
+        if fc and type(det.fluid_container.contents) == "table" then
+          fc.contents = shallow(det.fluid_container.contents)
+        end
+        d = { label = det.display_name or det.label, fluid_container = fc,
+              maxSize = tonumber(det.max_size or det.maxSize) }
       end
-      out[#out + 1] = it
-      tagged = tagged + 1
+      if detailCount >= DETAIL_MAX then detailCache, detailCount = {}, 0 end
+      detailCache[f.nbt_hash] = d
+      detailCount = detailCount + 1
     end
+    if d then
+      it.label = d.label or it.label
+      it.fluid_container = d.fluid_container
+      it.maxSize = d.maxSize or 64
+    end
+    out[#out + 1] = it
   end
-  raw = nil
-  -- если NBT-предметы через getAvailableItems не нашлись, лучше вернуть всё как есть
-  if tagged == 0 then return base end
   return out
+end
+
+local function meList(fname, fdmg)
+  local function fmatch(f)
+    return not fname or (f.id == fname and (fdmg == nil or math.floor(tonumber(f.dmg) or 0) == fdmg))
+  end
+  local ok, base, tagged
+  if fname then
+    ok, base = pcall(me.getItemsInNetwork, { name = fname, damage = fdmg })
+    if not ok then return tostring(base) end
+    if type(base) ~= "table" then return base end
+    if me.getAvailableItems == nil then return base end
+    -- тяжёлый getAvailableItems нужен только если среди предметов есть NBT
+    local anyTag = false
+    for _, it in ipairs(base) do
+      if type(it) == "table" and it.hasTag then anyTag = true; break end
+    end
+    if not anyTag then return base end
+    tagged = taggedFromRaw(fmatch)
+  else
+    -- полный список: сначала NBT-предметы (большой raw тут же освобождается), потом обычные
+    if me.getAvailableItems ~= nil then tagged = taggedFromRaw(fmatch); gc() end
+    ok, base = pcall(me.getItemsInNetwork)
+    if not ok then return tostring(base) end
+    if type(base) ~= "table" then return base end
+  end
+  return mergeTagged(base, tagged)
 end
 
 -- Лёгкий скан при входе: запоминаем остатки только нужных предметов.
@@ -517,9 +544,9 @@ local function scanME(who, full)
             end
           end
         end
-        if anyTag then                       -- есть NBT-предметы: один раз берём полный список с хешами
-          list = meList()
-          if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
+        if anyTag and me.getAvailableItems ~= nil then
+          -- есть NBT-предметы: один раз берём их хеши (только нужные id), полный список сети не держим
+          list = mergeTagged(list, taggedFromRaw(function(f) return want[f.id] end))
         end
       else
         list = meList()
@@ -559,6 +586,7 @@ end
 -- Поиск: каждое слово запроса должно встречаться в названии или id предмета.
 local function pickerScan(filter)
   cache.items = {}
+  gc()                                 -- результаты прошлого поиска и мусор от них - долой до нового запроса
   return pcall(function()
     local list = meList()
     if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
@@ -566,25 +594,30 @@ local function pickerScan(filter)
     local words = {}
     for w in searchNorm(filter or ""):gmatch("%S+") do words[#words + 1] = w end
 
-    -- Группируем предметы по модам: словарь переводов лежит по файлам-модам,
-    -- так каждый файл читается один раз подряд, а не дёргается по кругу.
-    local byMod, mods = {}, {}
-    for _, it in pairs(list) do
-      local nm = type(it) == "table" and it.name
-      if nm then
-        local m = tostring(nm):match("^([^:]+):") or "_"
-        local b = byMod[m]
-        if not b then b = {}; byMod[m] = b; mods[#mods + 1] = m end
-        b[#b + 1] = it
-      end
-    end
-    list = nil
+    -- Сортируем исходный список прямо на месте (без копий): предметы одного мода идут подряд,
+    -- поэтому файл словаря мода читается один раз, а не дёргается по кругу.
+    table.sort(list, function(a, b)
+      local an = type(a) == "table" and tostring(a.name) or ""
+      local bn = type(b) == "table" and tostring(b.name) or ""
+      if an ~= bn then return an < bn end
+      return (type(a) == "table" and tonumber(a.damage) or 0) < (type(b) == "table" and tonumber(b.damage) or 0)
+    end)
 
-    local out, seen = {}, {}
-    for _, m in ipairs(mods) do
-     local group = byMod[m]; byMod[m] = nil
-     for _, it in ipairs(group) do
-      local name = it.name
+    local function cmp(a, b)
+      if a[3] ~= b[3] then return a[3] < b[3] end
+      if a[1] ~= b[1] then return a[1] < b[1] end
+      return a[2] < b[2]
+    end
+
+    -- В памяти держим не все предметы ME, а только PICK_MAX первых по алфавиту:
+    -- копим буфер и, когда он вырос вдвое, сортируем и обрезаем.
+    local K = CONFIG.PICK_MAX
+    local buf, total = {}, 0
+    local prevKey, prevEntry
+    for i = 1, #list do
+      local it = list[i]
+      list[i] = false                  -- отпускаем ссылку сразу, как обработали
+      local name = type(it) == "table" and it.name
       if name then
         local var = variantOf(it)
         local label = labelOf(it, var)
@@ -598,31 +631,26 @@ local function pickerScan(filter)
         if match then
           local dmg = math.floor(tonumber(it.damage) or 0)
           local k = itemKey(name, dmg, var)
-          local e = seen[k]
-          if e then
-            e[4] = e[4] + (tonumber(it.size) or 0)
+          if k == prevKey then           -- тот же предмет подряд (несколько стеков): складываем количество
+            prevEntry[4] = prevEntry[4] + (tonumber(it.size) or 0)
           else
-            e = { name, dmg, label, tonumber(it.size) or 0, tonumber(it.maxSize) or 64, var }
-            seen[k] = e
-            out[#out + 1] = e
+            local e = { name, dmg, label, tonumber(it.size) or 0, tonumber(it.maxSize) or 64, var }
+            prevKey, prevEntry = k, e
+            total = total + 1
+            buf[#buf + 1] = e
+            if #buf >= K * 2 then
+              table.sort(buf, cmp)
+              for j = #buf, K + 1, -1 do buf[j] = nil end
+            end
           end
         end
       end
-     end
     end
-    seen = nil
-    table.sort(out, function(a, b)
-      if a[3] ~= b[3] then return a[3] < b[3] end
-      if a[1] ~= b[1] then return a[1] < b[1] end
-      return a[2] < b[2]
-    end)
-    -- показываем не больше CONFIG.PICK_MAX первых по алфавиту; остальное - через поиск
-    local total, more = #out, false
-    if total > CONFIG.PICK_MAX then
-      for i = total, CONFIG.PICK_MAX + 1, -1 do out[i] = nil end
-      more = true
-    end
-    cache.items, cache.pickTotal, cache.pickMore = out, total, more
+    list = nil
+    table.sort(buf, cmp)
+    local more = total > K
+    for j = #buf, K + 1, -1 do buf[j] = nil end
+    cache.items, cache.pickTotal, cache.pickMore = buf, total, more
     gc()
   end)
 end
@@ -1874,6 +1902,7 @@ local function screenPick()
   addBtn(48, 6, 16, 3, "Сбросить", { disabled = not hasFilter, fn = function() applyPickFilter("") end })
   local fromInv = (S.pickSource == "inv")
   local info = "Найдено: " .. cache.pickTotal .. (cache.pickMore and ("  (показаны первые " .. #cache.items .. ", уточните поиск)") or "")
+  info = info .. "   [свободно ОЗУ: " .. math.floor(computer.freeMemory() / 1024) .. " КБ]"   -- диагностика для владельца
   text(66, 6, pad(info, W - 66), C.dim, C.bg)
   text(66, 8, pad(fromInv and "Источник: ваш инвентарь (кол-во - у вас на руках)"
                   or ("Данные ME: " .. ageText()), W - 66), C.dim, C.bg)
