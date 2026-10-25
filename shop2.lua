@@ -634,9 +634,18 @@ end
 local IDEMPOTENT = { pushPlayer = true, allocId = true, fbAdd = true, fbOp = true, pushConfig = true, owner = true }
 local srvBox, replyCache, replyOrder = {}, {}, {}
 
+local seenTerm, lastBadKey = {}, -100
 function Net.serverHandle(e)
-  if e[4] ~= CONFIG.NET_PORT or e[6] ~= NET_TAG or e[7] ~= CONFIG.NET_KEY then return end
+  if e[4] ~= CONFIG.NET_PORT or e[6] ~= NET_TAG then return end
+  if e[7] ~= CONFIG.NET_KEY then
+    if computer.uptime() - lastBadKey > 10 then
+      lastBadKey = computer.uptime()
+      print("Запрос с неверным NET_KEY от " .. tostring(e[3]):sub(1, 8) .. " (ключ должен совпадать на всех ПК)")
+    end
+    return
+  end
   local remote, rid = e[3], e[8]
+  if not seenTerm[remote] then seenTerm[remote] = true; print("Терминал на связи: " .. tostring(remote):sub(1, 8)) end
   if type(rid) ~= "string" then return end
   if replyCache[rid] then netSend(remote, CONFIG.NET_PORT + 1, rid, replyCache[rid]); return end
   local str = netCollect(srvBox, remote .. rid, e[9], e[10], e[11])
@@ -2871,7 +2880,7 @@ function Net.serverMain()
     end
     if r[2] == "modem_message" then
       local e = { n = r.n - 1, table.unpack(r, 2, r.n) }
-      local ok, err = xpcall(serverHandle, debug.traceback, e)
+      local ok, err = xpcall(Net.serverHandle, debug.traceback, e)
       if not ok then print(tostring(err)); pcall(reportError, err) end
     end
     memGuard()
@@ -3160,6 +3169,26 @@ local function missingCli()
   print("Полный список: /home/kitshop/missing.txt")
 end
 
+-- проверка связи с сервером: lua shop.lua ping (на терминале)
+local function pingCli()
+  if MODE ~= "terminal" then print("ping выполняется на терминале (CONFIG.MODE = \"terminal\")."); return end
+  local wl = false
+  pcall(function() wl = modem.isWireless() end)
+  print("Модем: " .. modem.address:sub(1, 8) .. (wl and " (беспроводной)" or " (проводной)") ..
+        ", порт " .. CONFIG.NET_PORT .. ", ключ \"" .. CONFIG.NET_KEY .. "\"")
+  modem.open(CONFIG.NET_PORT + 1)
+  local t0 = computer.uptime()
+  local r = Net.call("hello", {}, 3)
+  if r and r.ok then print("OK: сервер ответил за " .. string.format("%.2f", computer.uptime() - t0) .. " с")
+  else
+    print("Сервер не ответил. Проверьте по порядку:")
+    print(" 1) на сервере запущен shop.lua (CONFIG.MODE = \"server\"), в его консоли нет ошибок;")
+    print(" 2) сервер и терминал соединены кабелем/Relay в одну сеть (или беспроводные карты в радиусе);")
+    print(" 3) NET_PORT и NET_KEY одинаковые на обоих ПК;")
+    print(" 4) если сервер пишет «неверный NET_KEY» - ключи различаются.")
+  end
+end
+
 -- диагностика: lua shop.lua methods - список методов ME Interface и пример getAvailableItems
 local function methodsCli()
   local ok, m = pcall(component.methods, me.address)
@@ -3232,7 +3261,8 @@ local function fpCli()
   end
 end
 
-if ARGS[1] == "fp" and me then fpCli()
+if ARGS[1] == "ping" then pingCli()
+elseif ARGS[1] == "fp" and me then fpCli()
 elseif ARGS[1] == "kits" then kitsCli()
 elseif ARGS[1] == "methods" then methodsCli()
 elseif ARGS[1] == "owner" then ownerCli()
