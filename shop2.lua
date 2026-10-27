@@ -14,6 +14,15 @@
     terminal   - ПК-терминал: PIM + ME Interface + экран + сетевая карта; базы у него нет,
                  все данные берёт у сервера. Терминалов можно ставить сколько угодно.
 
+  ЖУРНАЛ ОПЕРАЦИЙ (владелец: «Создание» -> «Журнал», рядом с «Отзывами»): покупки, пополнения, вывод,
+  выдача, правки владельца; фильтр по нику и типу. Вкладка «Балансы»: поиск игрока и правка баланса
+  (установить / прибавить-убавить), каждая правка пишется в журнал с ником владельца.
+
+  ЖУРНАЛ НАМЕРЕНИЙ ПОПОЛНЕНИЯ: перед тем как забрать предметы, записывается намерение (ник, предмет, цена,
+  количество). Зачисление атомарное и идемпотентное; если не прошло (обрыв связи, сбой диска), оно
+  повторяется при следующем входе игрока или запуске программы (файл CONFIG.OUTBOX_PATH). Подробнее - в
+  комментарии над функцией Net.jAdd.
+
   Экран рассчитан на 160x50 (подстраивается под реальное разрешение).
 ]]
 
@@ -57,6 +66,11 @@ local CONFIG = {
   FEEDBACK_COOLDOWN = 30,           -- пауза между отзывами одного игрока, сек
   FEEDBACK_MAX_LEN  = 200,
   FEEDBACK_KEEP     = 100,          -- сколько последних отзывов хранить
+
+  JOURNAL_KEEP      = 300,          -- сколько последних записей журнала операций показывать владельцу
+  JOURNAL_PATH      = "/home/kitshop/journal.log",  -- журнал операций: отдельный файл, только дописывается (на ПК с базой)
+  JOURNAL_MAX       = 400 * 1024,   -- больше этого размера (байт) файл уходит в journal.log.1, начинается новый
+  OUTBOX_PATH       = "/home/kitshop/outbox.dat",   -- незавершённые зачисления пополнений (на ПК с PIM)
 
   -- Сеть (для режимов server / terminal). На ВСЕХ ПК значения NET_PORT и NET_KEY должны совпадать.
   MODE        = "standalone",       -- "standalone" | "server" | "terminal"
@@ -304,7 +318,8 @@ end
 local db
 
 local function defaultDB()
-  return { owners = {}, ownerUids = {}, kits = {}, nextKitId = 1, topup = {}, players = {}, feedback = {}, nextPurchaseId = 1, withdraw = false, cfgVer = 0, nextFbId = 1 }
+  return { owners = {}, ownerUids = {}, kits = {}, nextKitId = 1, topup = {}, players = {}, feedback = {}, nextPurchaseId = 1, withdraw = false, cfgVer = 0, nextFbId = 1,
+           nextJid = 1, intents = {}, nextIntentId = 1 }
 end
 
 local function loadDB()
@@ -313,8 +328,13 @@ local function loadDB()
     if fs.exists(path) then
       local f = io.open(path, "r")
       if f then
-        local data = f:read("*a"); f:close()
-        local t = ser.unserialize(data)
+        local okR, data = pcall(f.read, f, "*a")
+        pcall(f.close, f)                              -- закрываем всегда, даже если чтение упало
+        local t
+        if okR and data then
+          local okU, res = pcall(ser.unserialize, data)
+          if okU then t = res end
+        end
         data = nil
         if type(t) == "table" then
           for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
@@ -334,12 +354,46 @@ local function saveDB()
   if MODE == "terminal" then return Net.flush() end      -- у терминала своей базы нет: отправляем на сервер
   pcall(fs.makeDirectory, fs.path(CONFIG.DB_PATH))
   local tmp = CONFIG.DB_PATH .. ".tmp"
+  local function bad(msg) Net.saveOk = false; error(msg, 0) end     -- запоминаем, что сохранение не работает
   memGuard()                           -- serialize строит всю базу строкой: освободим место заранее
-  local f = assert(io.open(tmp, "w"))
-  f:write(ser.serialize(db))
-  f:close()
-  fs.remove(CONFIG.DB_PATH)
-  fs.rename(tmp, CONFIG.DB_PATH)
+  -- строку строим ДО открытия файла: если serialize упадёт, ни одного дескриптора не потеряем
+  local okS, data = pcall(ser.serialize, db)
+  if not okS then
+    gc(); memGuard()
+    okS, data = pcall(ser.serialize, db)
+  end
+  if not okS then bad("saveDB serialize: " .. tostring(data), 0) end
+  local f, err = io.open(tmp, "w")
+  if not f then
+    gc()                               -- висящие дескрипторы закрываются сборщиком мусора: пробуем ещё раз
+    f, err = io.open(tmp, "w")
+  end
+  if not f then bad("saveDB open: " .. tostring(err), 0) end
+  local okW, werr = pcall(function()
+    local r, e = f:write(data)
+    if not r then error(e or "write failed", 0) end
+  end)
+  local okC, cerr = pcall(f.close, f)  -- закрываем ВСЕГДА (и при ошибке записи)
+  data = nil
+  if not okW then bad("saveDB write: " .. tostring(werr), 0) end
+  if not okC then bad("saveDB close: " .. tostring(cerr), 0) end
+  -- старую базу удаляем только когда новая полностью записана; если rename упадёт,
+  -- loadDB подхватит .tmp
+  pcall(fs.remove, CONFIG.DB_PATH)
+  local okR, rerr = fs.rename(tmp, CONFIG.DB_PATH)
+  if not okR then bad("saveDB rename: " .. tostring(rerr), 0) end
+  Net.saveOk = true
+  pcall(Net.jFlush)                    -- база сохранена: дописываем журнал операций в его файл
+end
+
+-- сохранить с одной повторной попыткой после сборки мусора; возвращает true или false, текст ошибки
+function Net.trySave()
+  local ok, err = pcall(saveDB)
+  if ok then return true end
+  gc()
+  ok, err = pcall(saveDB)
+  if ok then return true end
+  return false, tostring(err)
 end
 
 local function getPlayer(name)
@@ -444,6 +498,222 @@ local function unreadFeedback()
 end
 
 ----------------------------------------------------------------------
+-- ЖУРНАЛ ОПЕРАЦИЙ И ЖУРНАЛ НАМЕРЕНИЙ (ядро: работает с авторитетной db - одиночный ПК или сервер)
+--
+--   Журнал операций: покупки, пополнения, вывод, выдача, правки владельца (отдельный файл
+--   CONFIG.JOURNAL_PATH, только дописывается; не лежит в базе и не занимает ОЗУ). Виден владельцу во вкладке «Создание» -> «Журнал».
+--
+--   Журнал намерений (db.intents) - защита пополнения от «зависших» предметов:
+--     1) ПЕРЕД тем как забрать предметы, записывается намерение (ник, предмет, цена, сколько хотят внести);
+--     2) предметы уходят в ME; сколько реально ушло, пишется в файл-«исходящие» (CONFIG.OUTBOX_PATH)
+--        на ПК с PIM - он переживает и обрыв связи, и сбой сохранения базы;
+--     3) зачисление (баланс + запись в журнал + удаление намерения) делается ОДНОЙ атомарной операцией
+--        и идемпотентно: повтор того же зачисления ничего не удвоит;
+--     4) если зачисление не прошло - оно повторяется при следующем входе игрока или запуске программы.
+--   Намерение, у которого неизвестно, сколько предметов ушло (питание пропало ровно между шагами 1 и 2),
+--   помечается «unknown» и показывается владельцу на проверку.
+----------------------------------------------------------------------
+-- Запись попадает в очередь Net.jPending и пишется в файл ПОСЛЕ успешного сохранения базы (см. конец saveDB):
+-- так откат операции (jUndo) просто убирает запись из очереди, а в журнале не бывает записей об операциях,
+-- которых в базе нет. Если запись в файл не удалась, она остаётся в очереди и уйдёт со следующим сохранением.
+Net.jPending = {}
+function Net.jAdd(e)
+  db.nextJid = db.nextJid or 1
+  local ent = { id = db.nextJid, time = os.time(), kind = tostring(e.kind or "?"):sub(1, 16),
+                player = tostring(e.player or "?"):sub(1, 40), text = tostring(e.text or ""):sub(1, 160),
+                delta = round2(tonumber(e.delta) or 0), bal = e.bal and round2(tonumber(e.bal) or 0) or nil,
+                by = e.by and tostring(e.by):sub(1, 40) or nil }
+  db.nextJid = db.nextJid + 1
+  local pq = Net.jPending
+  pq[#pq + 1] = ent
+  while #pq > 500 do table.remove(pq, 1) end
+  return ent
+end
+
+-- откат записи журнала, если операцию не удалось сохранить
+function Net.jUndo(ent)
+  local pq = Net.jPending
+  for i = #pq, 1, -1 do
+    if pq[i] == ent then table.remove(pq, i); break end
+  end
+end
+
+-- дописать накопленные записи в файл журнала; true - всё записано
+function Net.jFlush()
+  local pq = Net.jPending
+  if #pq == 0 then return true end
+  pcall(fs.makeDirectory, fs.path(CONFIG.JOURNAL_PATH))
+  local okS, sz = pcall(fs.size, CONFIG.JOURNAL_PATH)
+  if okS and (tonumber(sz) or 0) > (CONFIG.JOURNAL_MAX or 409600) then
+    pcall(fs.remove, CONFIG.JOURNAL_PATH .. ".1")
+    pcall(fs.rename, CONFIG.JOURNAL_PATH, CONFIG.JOURNAL_PATH .. ".1")
+  end
+  local lines = {}
+  for _, e in ipairs(pq) do lines[#lines + 1] = (ser.serialize(e):gsub("[\r\n]", " ")) end
+  local f = io.open(CONFIG.JOURNAL_PATH, "a")
+  if not f then return false end
+  local okW = pcall(f.write, f, table.concat(lines, "\n") .. "\n")
+  pcall(f.close, f)
+  if okW then Net.jPending = {} end
+  return okW
+end
+
+-- последние CONFIG.JOURNAL_KEEP записей (с фильтром по нику) из файла + ещё не записанные; файл читается построчно
+function Net.jList(filter)
+  filter = lower(filter or "")
+  local keep = CONFIG.JOURNAL_KEEP or 300
+  local out = {}
+  local function take(e)
+    if type(e) == "table" and (filter == "" or lower(tostring(e.player)):find(filter, 1, true)) then
+      out[#out + 1] = e
+      if #out >= keep * 2 then
+        local cut = {}
+        for i = #out - keep + 1, #out do cut[#cut + 1] = out[i] end
+        out = cut
+      end
+    end
+  end
+  pcall(function()
+    local f = io.open(CONFIG.JOURNAL_PATH, "r")
+    if not f then return end
+    pcall(function()
+      for line in f:lines() do
+        if line ~= "" then
+          local okU, e = pcall(ser.unserialize, line)
+          if okU then take(e) end
+        end
+      end
+    end)
+    pcall(f.close, f)
+  end)
+  for _, e in ipairs(Net.jPending) do take(e) end
+  while #out > keep do table.remove(out, 1) end
+  return out, db.intents or {}
+end
+
+function Net.pList(filter)
+  local out = {}
+  filter = lower(filter or "")
+  for _, p in pairs(db.players) do
+    if filter == "" or lower(p.name):find(filter, 1, true) then
+      out[#out + 1] = { name = p.name, balance = tonumber(p.balance) or 0, pend = pendingCount(p) }
+    end
+  end
+  table.sort(out, function(a, b) return lower(a.name) < lower(b.name) end)
+  while #out > 300 do out[#out] = nil end
+  return out
+end
+
+-- правка баланса владельцем. mode: "set" - установить, "add" - прибавить (можно отрицательное)
+function Net.adjustBalance(who, name, mode, value, reason)
+  if not isOwner(tostring(who)) then return { err = "forbidden" } end
+  reason = trim(tostring(reason or "")):gsub("%s+", " ")
+  if unicode.len(reason) < 3 then return { err = "noreason" } end      -- причина обязательна
+  reason = unicode.sub(reason, 1, 80)
+  local p = db.players[lower(tostring(name))]
+  if not p then return { err = "noplayer" } end
+  value = round2(tonumber(value) or 0)
+  local old = round2(tonumber(p.balance) or 0)
+  local new = (mode == "add") and round2(old + value) or value
+  if new < 0 then return { err = "neg" } end
+  if new > 10000000 then return { err = "big" } end
+  local oldRev = p.rev
+  p.balance, p.rev = new, (p.rev or 0) + 1
+  local ent = Net.jAdd({ kind = "edit", player = p.name, delta = new - old, bal = new, by = who,
+                         text = "Правка: " .. fmt(old) .. " -> " .. fmt(new) .. ". Причина: " .. reason })
+  local ok, err = Net.trySave()
+  if not ok then
+    p.balance, p.rev = old, oldRev
+    Net.jUndo(ent)
+    print("adjustBalance: не удалось сохранить базу: " .. tostring(err))
+    return { err = "save" }
+  end
+  return { ok = true, old = old, bal = new }
+end
+
+function Net.findIntent(id)
+  for i, it in ipairs(db.intents or {}) do if it.id == id then return it, i end end
+end
+
+-- 1) записать намерение (ДО того как предметы ушли в ME). Возвращает id или nil, ошибка
+function Net.iNew(a)
+  db.intents = db.intents or {}
+  db.nextIntentId = db.nextIntentId or 1
+  local it = { id = db.nextIntentId, player = tostring(a.player), name = a.name, damage = a.damage, var = a.var,
+               label = tostring(a.label or a.name), price = tonumber(a.price) or 0, want = tonumber(a.want) or 0,
+               state = "pending", time = os.time() }
+  db.nextIntentId = it.id + 1
+  db.intents[#db.intents + 1] = it
+  local ok, err = Net.trySave()
+  if not ok then
+    db.intents[#db.intents] = nil
+    db.nextIntentId = it.id
+    return nil, err
+  end
+  return it.id
+end
+
+-- 3) зачесть пополнение: moved предметов реально ушло в ME (moved <= 0 - отмена намерения).
+-- Идемпотентно: если намерения уже нет (зачтено раньше), просто отвечает ok.
+function Net.iFinish(id, moved)
+  local it, idx = Net.findIntent(id)
+  if not it then return { ok = true, done = true } end
+  moved = math.floor(tonumber(moved) or 0)
+  if moved > it.want then moved = math.floor(it.want) end
+  if moved <= 0 then
+    table.remove(db.intents, idx)
+    local ok = Net.trySave()
+    if not ok then table.insert(db.intents, idx, it); return { err = "save" } end
+    return { ok = true, gain = 0, player = it.player }
+  end
+  local p = getPlayer(it.player)
+  local gain = round2(moved * it.price)
+  local oldBal, oldRev = p.balance, p.rev
+  p.balance, p.rev = round2(p.balance + gain), (p.rev or 0) + 1
+  table.remove(db.intents, idx)
+  local ent = Net.jAdd({ kind = "deposit", player = p.name, delta = gain, bal = p.balance,
+                         text = "Пополнение: " .. it.label .. " x" .. moved })
+  local ok, err = Net.trySave()
+  if not ok then
+    p.balance, p.rev = oldBal, oldRev
+    table.insert(db.intents, idx, it)
+    Net.jUndo(ent)
+    print("iFinish: не удалось сохранить базу: " .. tostring(err))
+    return { err = "save" }
+  end
+  return { ok = true, gain = gain, bal = p.balance, moved = moved, label = it.label, player = p.name }
+end
+
+-- намерения, у которых неизвестно, сколько ушло в ME, переводим в «unknown» (name - только этого игрока).
+-- Если потом придёт iFinish с точным числом, оно всё равно будет зачтено.
+function Net.iSweep(name)
+  local changed = 0
+  for _, it in ipairs(db.intents or {}) do
+    if it.state == "pending" and (not name or lower(it.player) == lower(name)) then
+      it.state = "unknown"; changed = changed + 1
+    end
+  end
+  if changed > 0 then pcall(Net.trySave) end
+  return changed
+end
+
+-- владелец закрывает намерение «unknown» после ручной проверки
+function Net.iDrop(who, id)
+  if not isOwner(tostring(who)) then return { err = "forbidden" } end
+  local it, idx = Net.findIntent(id)
+  if not it then return { ok = true } end
+  table.remove(db.intents, idx)
+  local ent = Net.jAdd({ kind = "intent", player = it.player, by = who,
+                         text = "Намерение закрыто владельцем: " .. it.label .. " (хотели внести " .. fmt(it.want) .. ")" })
+  local ok = Net.trySave()
+  if not ok then
+    table.insert(db.intents, idx, it); Net.jUndo(ent)
+    return { err = "save" }
+  end
+  return { ok = true }
+end
+
+----------------------------------------------------------------------
 -- СЕТЬ: сервер хранит базу, терминалы спрашивают его по модему
 ----------------------------------------------------------------------
 do
@@ -497,12 +767,18 @@ local function cfgOf()
   return { kits = db.kits, nextKitId = db.nextKitId, topup = db.topup, withdraw = db.withdraw }
 end
 
-SRV.hello = function() return { ok = true } end
+-- hello = проверка здоровья: сервер жив и умеет сохранять. Если последнее сохранение упало,
+-- пробуем сохранить ещё раз (вдруг память/дескрипторы освободились) и честно сообщаем результат.
+SRV.hello = function()
+  if Net.saveOk == false then Net.trySave() end
+  return { ok = true, saving = Net.saveOk ~= false }
+end
 
 SRV.login = function(a)
   local name = tostring(a.name)
   local owner = isOwner(name, a.uid)
   local p = getPlayer(name)
+  Net.iSweep(name)           -- намерения прошлого визита с неизвестным результатом -> на проверку владельцу
   return { ok = true, owner = owner, player = p, cfg = cfgOf(), ver = db.cfgVer or 0, unread = unreadFeedback() }
 end
 
@@ -514,11 +790,18 @@ SRV.pushConfig = function(a)
   if not isOwner(tostring(a.who)) then return { err = "forbidden" } end
   if (db.cfgVer or 0) ~= a.base then return { err = "stale" } end
   local c = a.cfg or {}
+  local oKits, oTopup, oNext, oWd, oVer = db.kits, db.topup, db.nextKitId, db.withdraw, db.cfgVer
   db.kits, db.topup = c.kits or {}, c.topup or {}
   db.nextKitId = c.nextKitId or db.nextKitId
   db.withdraw = c.withdraw or false
   db.cfgVer = (db.cfgVer or 0) + 1
-  saveDB()
+  local okSave, serr = Net.trySave()
+  if not okSave then
+    -- не сохранилось: возвращаем прежние настройки, чтобы память не разошлась с диском
+    db.kits, db.topup, db.nextKitId, db.withdraw, db.cfgVer = oKits, oTopup, oNext, oWd, oVer
+    print("pushConfig: не удалось сохранить базу: " .. serr)
+    return { err = "save" }
+  end
   return { ok = true, ver = db.cfgVer }
 end
 
@@ -526,7 +809,7 @@ end
 SRV.pushPlayer = function(a)
   local sp = getPlayer(tostring(a.name))
   if (sp.rev or 0) ~= (a.base or 0) then return { err = "rev" } end
-  local oldBal, oldPur = sp.balance, sp.purchases
+  local oldBal, oldPur, oldRev = sp.balance, sp.purchases, sp.rev
   sp.balance, sp.purchases = tonumber(a.rec.balance) or 0, a.rec.purchases or {}
   if a.chk then
     local res = reservedMap()
@@ -538,7 +821,21 @@ SRV.pushPlayer = function(a)
     end
   end
   sp.rev = (sp.rev or 0) + 1
-  saveDB()
+  local added = {}                      -- записи журнала, пришедшие вместе с операцией (одно сохранение на всё)
+  for _, le in ipairs(type(a.log) == "table" and a.log or {}) do
+    if type(le) == "table" then
+      added[#added + 1] = Net.jAdd({ kind = le.kind, player = sp.name, text = le.text, delta = le.delta, bal = sp.balance })
+    end
+  end
+  local okSave, serr = Net.trySave()
+  if not okSave then
+    -- на диск не записалось: откатываем память и честно отвечаем ошибкой. Терминал в этом случае
+    -- ничего не выдаст (покупка) или не заберёт предметы (пополнение), а баланс останется прежним
+    for i = #added, 1, -1 do Net.jUndo(added[i]) end
+    sp.balance, sp.purchases, sp.rev = oldBal, oldPur, oldRev
+    print("pushPlayer " .. tostring(a.name) .. ": не удалось сохранить базу: " .. serr)
+    return { err = "save" }
+  end
   return { ok = true, rev = sp.rev }
 end
 
@@ -557,7 +854,12 @@ end
 SRV.allocId = function()
   local id = db.nextPurchaseId
   db.nextPurchaseId = id + 1
-  saveDB()
+  local ok, serr = Net.trySave()
+  if not ok then
+    db.nextPurchaseId = id
+    print("allocId: не удалось сохранить базу: " .. tostring(serr))
+    return { err = "save" }
+  end
   return { ok = true, id = id }
 end
 
@@ -570,11 +872,18 @@ end
 
 SRV.fbAdd = function(a)
   fbIds()
+  local snap, oldNext = {}, db.nextFbId
+  for i, f in ipairs(db.feedback) do snap[i] = f end
   db.feedback[#db.feedback + 1] = { id = db.nextFbId, player = tostring(a.player), text = tostring(a.text):sub(1, 300),
                                     time = os.time(), read = false }
   db.nextFbId = db.nextFbId + 1
   while #db.feedback > CONFIG.FEEDBACK_KEEP do table.remove(db.feedback, 1) end
-  saveDB()
+  local ok, serr = Net.trySave()
+  if not ok then
+    db.feedback, db.nextFbId = snap, oldNext
+    print("fbAdd: не удалось сохранить базу: " .. tostring(serr))
+    return { err = "save" }
+  end
   return { ok = true }
 end
 
@@ -585,27 +894,75 @@ end
 
 SRV.fbOp = function(a)
   fbIds()
+  local snap, flags = {}, {}
+  for i, f in ipairs(db.feedback) do snap[i] = f; flags[i] = f.read end
   if a.op == "read" then for _, f in ipairs(db.feedback) do f.read = true end
   elseif a.op == "clear" then db.feedback = {}
   elseif a.op == "del" then
     for i = #db.feedback, 1, -1 do if db.feedback[i].id == a.id then table.remove(db.feedback, i) end end
   end
-  saveDB()
+  local ok, serr = Net.trySave()
+  if not ok then
+    db.feedback = snap
+    for i, f in ipairs(snap) do f.read = flags[i] end
+    print("fbOp: не удалось сохранить базу: " .. tostring(serr))
+    return { err = "save" }
+  end
   return { ok = true }
 end
 
+-- журнал операций, список игроков и правка баланса (только для владельца)
+SRV.journal = function(a)
+  if not isOwner(tostring(a.who)) then return { err = "forbidden" } end
+  local list, intents = Net.jList(a.filter)
+  return { ok = true, list = list, intents = intents }
+end
+
+SRV.players = function(a)
+  if not isOwner(tostring(a.who)) then return { err = "forbidden" } end
+  return { ok = true, list = Net.pList(a.filter) }
+end
+
+SRV.adjust = function(a) return Net.adjustBalance(a.who, a.name, a.mode, a.value, a.reason) end
+
+-- журнал намерений пополнения
+SRV.intentNew = function(a)
+  local id, err = Net.iNew(a)
+  if not id then print("intentNew: не удалось сохранить базу: " .. tostring(err)); return { err = "save" } end
+  return { ok = true, id = id }
+end
+SRV.intentDone = function(a) return Net.iFinish(a.id, a.moved) end
+SRV.intentDrop = function(a) return Net.iDrop(a.who, a.id) end
+
 SRV.owner = function(a)
   local cmd, nick, lines = a.cmd, a.nick, {}
+  local oOwners, oUids = {}, {}
+  for i, o in ipairs(db.owners) do oOwners[i] = o end
+  for k, v in pairs(db.ownerUids or {}) do oUids[k] = v end
+  local SAVEFAIL = { err = "Не удалось сохранить базу. Команда не применена, повторите её." }
+  local function commit()
+    local ok, serr = Net.trySave()
+    if not ok then
+      db.owners, db.ownerUids = oOwners, oUids
+      print("owner: не удалось сохранить базу: " .. tostring(serr))
+    end
+    return ok
+  end
   if cmd == "add" and nick then
     if isOwner(nick) then lines[1] = "Уже владелец: " .. nick
-    else db.owners[#db.owners + 1] = nick; saveDB(); lines[1] = "Владелец добавлен: " .. nick end
+    else
+      db.owners[#db.owners + 1] = nick
+      if not commit() then return SAVEFAIL end
+      lines[1] = "Владелец добавлен: " .. nick
+    end
   elseif cmd == "del" and nick then
     for i = #db.owners, 1, -1 do
       if lower(db.owners[i]) == lower(nick) then table.remove(db.owners, i) end
     end
     db.ownerUids = db.ownerUids or {}
     db.ownerUids[lower(nick)] = nil
-    saveDB(); lines[1] = "Удалён из владельцев: " .. nick
+    if not commit() then return SAVEFAIL end
+    lines[1] = "Удалён из владельцев: " .. nick
   elseif cmd == "list" then
     for _, o in ipairs(CONFIG.OWNERS) do lines[#lines + 1] = o .. "  (из файла)" end
     for _, o in ipairs(db.owners) do lines[#lines + 1] = o end
@@ -619,7 +976,9 @@ end
 function Net.applyQueue()
   local f = io.open(CONFIG.CMD_PATH, "r")
   if not f then return end
-  local data = f:read("*a"); f:close()
+  local okR, data = pcall(f.read, f, "*a")
+  pcall(f.close, f)
+  if not okR or not data then return end
   pcall(fs.remove, CONFIG.CMD_PATH)
   for line in data:gmatch("[^\n]+") do
     local cmd, nick = line:match("^(%w+)\t(.+)$")
@@ -631,7 +990,8 @@ function Net.applyQueue()
 end
 
 -- команды, ответ на которые кэшируется: повтор запроса (потерялся ответ) не должен выполнить его дважды
-local IDEMPOTENT = { pushPlayer = true, allocId = true, fbAdd = true, fbOp = true, pushConfig = true, owner = true }
+local IDEMPOTENT = { pushPlayer = true, allocId = true, fbAdd = true, fbOp = true, pushConfig = true, owner = true,
+                     adjust = true, intentNew = true, intentDone = true, intentDrop = true }
 local srvBox, replyCache, replyOrder = {}, {}, {}
 
 local seenTerm, lastBadKey = {}, -100
@@ -654,12 +1014,16 @@ function Net.serverHandle(e)
   local reply
   if type(req) == "table" and req.cmd ~= "owner" and SRV[req.cmd] then
     local ok, r = xpcall(SRV[req.cmd], debug.traceback, type(req.a) == "table" and req.a or {})
-    if ok then reply = r else reply = { err = "server: " .. tostring(r):sub(1, 300) }; print(tostring(r)) end
+    if ok then reply = r
+    else
+      reply = { err = "server: " .. tostring(r):sub(1, 300) }; print(tostring(r))
+      pcall(function() Net.reportError(r) end)          -- в error.log и в «Отзывы»
+    end
   else
     reply = { err = "unknown command" }
   end
   local out = ser.serialize(reply)
-  if req and IDEMPOTENT[req.cmd] then
+  if req and IDEMPOTENT[req.cmd] and type(reply) == "table" and reply.ok then   -- ошибки не кэшируем: повтор должен выполниться заново
     replyCache[rid] = out
     replyOrder[#replyOrder + 1] = rid
     if #replyOrder > 100 then replyCache[table.remove(replyOrder, 1)] = nil end
@@ -709,6 +1073,7 @@ end
 -- то же, но любой отказ сервера тоже считается ошибкой
 function Net.req(cmd, a, tries)
   local r = Net.try(cmd, a, tries)
+  if r.err == "save" then error("USERMSG:Сервер не смог сохранить данные. Повторите позже.", 0) end
   if r.err then error("USERMSG:Ошибка сервера: " .. tostring(r.err):sub(1, 120), 0) end
   return r
 end
@@ -743,7 +1108,7 @@ function Net.login(name, uid)
   db.players[lower(name)] = r.player
   Net.who, Net.owner, Net.unread, Net.fbLoaded = name, r.owner, r.unread or 0, false
   db.feedback = {}
-  Net.res = nil
+  Net.res, Net.jq, Net.jc, Net.pc = nil, {}, nil, nil
   applyCfg(r.cfg, r.ver)
   return r
 end
@@ -751,20 +1116,26 @@ end
 function Net.logout()
   db.players, db.feedback = {}, {}
   Net.who, Net.owner, Net.cfgSnap, Net.fbLoaded = nil, false, nil, false
-  Net.res = nil
+  Net.res, Net.jq, Net.jc, Net.pc = nil, {}, nil, nil
 end
 
 -- отправка записи игрока; false, причина - если сервер не принял
 local function pushPlayerRec(p, chk, tries)
+  local lg = (Net.jq and #Net.jq > 0) and Net.jq or nil      -- записи журнала едут вместе с операцией
   local r = Net.try("pushPlayer", { name = p.name, base = p.rev or 0,
-                                    rec = { balance = p.balance, purchases = p.purchases }, chk = chk }, tries)
+                                    rec = { balance = p.balance, purchases = p.purchases }, chk = chk, log = lg }, tries)
   Net.res = nil
-  if r.ok then p.rev = r.rev; return true end
+  if r.ok then
+    p.rev = r.rev
+    if lg then Net.jq = {} end
+    return true
+  end
   return false, r.err
 end
 
 -- откат: взять запись игрока у сервера заново (если не получилось - убрать локальную, она подтянется позже)
 local function rollbackPlayer(name)
+  Net.jq = {}                               -- операция отменена: её записи в журнал не нужны
   if not pcall(Net.pullPlayer, name) then db.players[lower(name)] = nil end
 end
 
@@ -778,6 +1149,10 @@ function Net.flush()
         pcall(Net.pullConfig)
         error("USERMSG:Настройки изменили с другого терминала. Действие отменено, повторите.", 0)
       end
+      if r.err == "save" then
+        pcall(Net.pullConfig)
+        error("USERMSG:Сервер не смог сохранить настройки. Действие отменено, повторите позже.", 0)
+      end
       if r.err then error("USERMSG:Ошибка сервера: " .. tostring(r.err):sub(1, 120), 0) end
       Net.cfgVer, Net.cfgSnap = r.ver, snap
     end
@@ -787,9 +1162,31 @@ function Net.flush()
     if not okc then rollbackPlayer(p.name); error(ok, 0) end
     if not ok then
       rollbackPlayer(p.name)
+      if ok == false and why == "save" then
+        error("USERMSG:Сервер не смог сохранить данные. Действие отменено, повторите позже.", 0)
+      end
       error("USERMSG:Данные игрока обновились на другом терминале. Повторите действие.", 0)
     end
   end
+end
+
+-- проверка перед покупкой / пополнением / выводом: сервер отвечает и может сохранять данные.
+-- true или false, текст для игрока. Вызывать ДО списания и до приёма предметов.
+function Net.preflight(notify)       -- notify(текст) - показать статус (передаёт вызывающий)
+  if MODE ~= "terminal" then
+    if Net.saveOk == false and not Net.trySave() then
+      return false, "Магазин временно не может сохранять данные. Ничего не списано, повторите позже."
+    end
+    return true
+  end
+  if notify then notify("Проверяю связь с сервером...") end
+  local r = Net.call("hello", {}, 2)
+  if not r then return false, "Нет связи с сервером. Ничего не списано, попробуйте позже." end
+  if r.err or not r.ok then return false, "Сервер сейчас недоступен. Ничего не списано, попробуйте позже." end
+  if r.saving == false then
+    return false, "Сервер временно не может сохранять данные. Ничего не списано, повторите позже."
+  end
+  return true
 end
 
 -- покупка: записать игрока с проверкой остатков на сервере. true или false, текст для игрока
@@ -800,6 +1197,7 @@ function Net.commitPlayer(p, chk)
   if ok then return true end
   rollbackPlayer(name)
   if why == "stock" then return false, "Комплект только что закончился (его купили на другом терминале)." end
+  if why == "save" then return false, "Сервер не смог сохранить данные. Операция отменена, повторите позже." end
   return false, "Данные игрока обновились на другом терминале. Повторите действие."
 end
 
@@ -839,6 +1237,157 @@ function Net.fbAddEntry(player, text)
   db.feedback[#db.feedback + 1] = { player = player, text = text, time = os.time(), read = false }
   while #db.feedback > CONFIG.FEEDBACK_KEEP do table.remove(db.feedback, 1) end
   saveDB()
+end
+
+---------- журнал операций (запись со стороны терминала / одиночного ПК) ----------
+-- Одиночный ПК: запись сразу в db (сохранится тем же saveDB, что и сама операция).
+-- Терминал: запись ждёт в очереди и уезжает на сервер вместе с записью игрока (одно атомарное сохранение).
+function Net.log(kind, player, text, delta, bal)
+  local e = { kind = kind, player = player, text = text, delta = delta, bal = bal }
+  if MODE == "terminal" then
+    Net.jq = Net.jq or {}
+    Net.jq[#Net.jq + 1] = e
+  else
+    Net.jAdd(e)
+  end
+end
+
+-- журнал для экрана владельца: список записей и незавершённые намерения
+function Net.jView(filter, force)
+  filter = lower(filter or "")
+  if MODE ~= "terminal" then return Net.jList(filter) end
+  local c = Net.jc
+  if force or not c or c.f ~= filter or computer.uptime() - c.t > 5 then
+    local r = Net.req("journal", { who = Net.who, filter = filter })
+    c = { f = filter, t = computer.uptime(), list = r.list or {}, intents = r.intents or {} }
+    Net.jc = c
+  end
+  return c.list, c.intents
+end
+
+-- игроки для экрана «Балансы»
+function Net.pView(filter, force)
+  filter = lower(filter or "")
+  if MODE ~= "terminal" then return Net.pList(filter) end
+  local c = Net.pc
+  if force or not c or c.f ~= filter or computer.uptime() - c.t > 5 then
+    local r = Net.req("players", { who = Net.who, filter = filter })
+    c = { f = filter, t = computer.uptime(), list = r.list or {} }
+    Net.pc = c
+  end
+  return c.list
+end
+
+function Net.doAdjust(who, name, mode, value, reason)
+  local r
+  if MODE == "terminal" then
+    r = Net.try("adjust", { who = who, name = name, mode = mode, value = value, reason = reason }, 4)
+    -- версия записи игрока на сервере выросла: если это игрок на этом терминале, берём запись заново
+    if r.ok and db.players[lower(name)] then pcall(Net.pullPlayer, name) end
+  else
+    r = Net.adjustBalance(who, name, mode, value, reason)
+  end
+  Net.jc, Net.pc = nil, nil
+  return r
+end
+
+function Net.doDrop(who, id)
+  local r
+  if MODE == "terminal" then r = Net.try("intentDrop", { who = who, id = id }, 4)
+  else r = Net.iDrop(who, id) end
+  Net.jc = nil
+  return r
+end
+
+---------- журнал намерений пополнения (сторона ПК с PIM) ----------
+-- 1) записать намерение ДО того как предметы уйдут. Возвращает id или nil
+function Net.depositBegin(a)
+  if MODE == "terminal" then
+    local r = Net.call("intentNew", a, 3)
+    if r and r.ok then return r.id end
+    return nil
+  end
+  return (Net.iNew(a))
+end
+
+-- файл «исходящих»: сколько предметов уже ушло в ME, но зачисление ещё не подтверждено
+function Net.outboxLoad()
+  local f = io.open(CONFIG.OUTBOX_PATH, "r")
+  if not f then return {} end
+  local okR, data = pcall(f.read, f, "*a")
+  pcall(f.close, f)
+  if okR and data and data ~= "" then
+    local okU, t = pcall(ser.unserialize, data)
+    if okU and type(t) == "table" then return t end
+  end
+  return {}
+end
+
+function Net.outboxSave(t)
+  if #t == 0 then pcall(fs.remove, CONFIG.OUTBOX_PATH); return true end
+  pcall(fs.makeDirectory, fs.path(CONFIG.OUTBOX_PATH))
+  local f = io.open(CONFIG.OUTBOX_PATH, "w")
+  if not f then return false end
+  local okW = pcall(f.write, f, ser.serialize(t))
+  pcall(f.close, f)
+  return okW
+end
+
+function Net.outboxAdd(en)
+  local t = Net.outboxLoad()
+  t[#t + 1] = en
+  return Net.outboxSave(t)
+end
+
+function Net.outboxDel(id)
+  local t, out = Net.outboxLoad(), {}
+  for _, en in ipairs(t) do if en.id ~= id then out[#out + 1] = en end end
+  Net.outboxSave(out)
+end
+
+-- 3) зачисление на авторитетной базе; ответ-таблица при успехе, nil - не прошло (повторим позже)
+function Net.depositFinish(id, moved)
+  if MODE == "terminal" then
+    local r = Net.call("intentDone", { id = id, moved = moved }, 4)
+    if r and r.ok then return r end
+    return nil
+  end
+  local ok, r = pcall(Net.iFinish, id, moved)
+  if ok and type(r) == "table" and r.ok then return r end
+  return nil
+end
+
+-- зачисление после того, как предметы ушли в ME. Возвращает ответ с gain/bal или nil
+function Net.depositEnd(id, moved, player)
+  if moved <= 0 then                      -- ничего не ушло: просто отменяем намерение
+    pcall(Net.depositFinish, id, 0)
+    return { ok = true, gain = 0 }
+  end
+  Net.outboxAdd({ id = id, moved = moved, player = player })      -- запомнили на диске ДО обращения к базе
+  local r = Net.depositFinish(id, moved)
+  if not r then return nil end
+  Net.outboxDel(id)
+  -- запись игрока на терминале устарела (сервер поднял версию): берём заново
+  if MODE == "terminal" and player and db.players[lower(player)] then pcall(Net.pullPlayer, player) end
+  return r
+end
+
+-- повтор незавершённых зачислений (при запуске программы и при входе игрока).
+-- Возвращает сколько зачислено и сколько монет получил игрок who (если указан)
+function Net.outboxRetry(who)
+  local t = Net.outboxLoad()
+  if #t == 0 then return 0, 0 end
+  local n, mine = 0, 0
+  for _, en in ipairs(t) do
+    local r = Net.depositFinish(en.id, en.moved)
+    if r then
+      Net.outboxDel(en.id)
+      n = n + 1
+      if who and en.player and lower(en.player) == lower(who) then mine = mine + (r.gain or 0) end
+    end
+  end
+  if n > 0 and MODE == "terminal" and who and db.players[lower(who)] then pcall(Net.pullPlayer, who) end
+  return n, round2(mine)
 end
 end
 
@@ -1623,6 +2172,8 @@ local function doBuy(kit)
     return flash("Не хватает средств: нужно " .. fmt(kit.price) .. ", на балансе " .. fmt(p.balance) ..
                  ". Загляните во вкладку «Пополнение».", false)
   end
+  local pf, pfWhy = Net.preflight(status)
+  if not pf then return flash(pfWhy, false) end
   status("Проверяю наличие ресурсов...")
   local ok, err, chk = verifyStock(kit)
   if not ok then return flash(err, false) end
@@ -1634,6 +2185,7 @@ local function doBuy(kit)
                                 customLabel = it.customLabel, qty = it.qty }
   end
   p.purchases[#p.purchases + 1] = pu
+  Net.log("buy", p.name, "Покупка #" .. pu.id .. ": «" .. kit.name .. "»", -kit.price, p.balance)
   if MODE == "terminal" then
     local okc, why = Net.commitPlayer(p, chk)
     if not okc then return flash(why, false) end
@@ -1751,6 +2303,10 @@ local function doClaim(pu, it, quiet)
   local given = math.max(0, math.min(deliver, after - before))
   if given < deliver then it.qty = it.qty + (deliver - given) end
   if cache.byKey[key] then cache.byKey[key].size = math.max(0, cache.byKey[key].size - given) end
+  if given > 0 then
+    Net.log("claim", S.player.name, "Выдача #" .. tostring(pu.id) .. ": " .. shown .. " x" .. given
+            .. (it.qty > 0 and (" (осталось " .. it.qty .. ")") or ""), 0, getPlayer(S.player.name).balance)
+  end
   saveDB()
 
   if given == 0 then
@@ -1830,6 +2386,21 @@ local function doDeposit(e, amount)
   local want = amount and math.min(amount, have) or have
   if want <= 0 then return flash("В инвентаре нет «" .. e.label .. "».", false) end
 
+  local pf, pfWhy = Net.preflight(status)                  -- до того, как предметы уйдут в ME
+  if not pf then return flash(pfWhy, false) end
+
+  -- раньше завершаем недозачисленное из прошлых пополнений (если оно есть)
+  pcall(Net.outboxRetry, S.player.name)
+
+  -- 1) НАМЕРЕНИЕ: записываем (ник, предмет, цена, сколько вносим) ДО того как забрать предметы.
+  -- Не записалось - предметы не трогаем.
+  status("Записываю намерение пополнения...")
+  local iid = Net.depositBegin({ player = S.player.name, name = e.name, damage = e.damage, var = e.var,
+                                 label = e.label, price = e.price, want = want })
+  if not iid then
+    return flash("Не удалось записать пополнение в журнал. Предметы не тронуты, повторите позже.", false)
+  end
+
   status("Принимаю ресурсы...")
   lastPushErr = nil
   local left = want
@@ -1846,18 +2417,23 @@ local function doDeposit(e, amount)
   local moved = math.max(0, math.min(want, have - after))
   S.slots = afterSlots
   if moved <= 0 then
+    pcall(Net.depositEnd, iid, 0, S.player.name)           -- ничего не ушло: намерение отменяем
     local msg = "Не удалось принять предметы. Проверьте подключение ME Interface к PIM и свободное место в ME."
     if S.player.owner and lastPushErr then msg = msg .. " [" .. lastPushErr:sub(1, 80) .. "]" end
     return flash(msg, false)
   end
 
-  local p = getPlayer(S.player.name)
-  local gain = round2(moved * e.price)
-  p.balance = round2(p.balance + gain)
   local c = cache.byKey[itemKey(e.name, e.damage, e.var)]
   if c then c.size = c.size + moved end
-  saveDB()
-  flash("Принято " .. moved .. " шт. «" .. e.label .. "». Зачислено: " .. fmt(gain) .. " " .. CONFIG.CURRENCY, true)
+
+  -- 2-3) предметы уже в ME: зачисляем. Не вышло - зачисление повторится при следующем входе или запуске
+  status("Зачисляю на баланс...")
+  local okE, r = pcall(Net.depositEnd, iid, moved, S.player.name)
+  if okE and r then
+    return flash("Принято " .. moved .. " шт. «" .. e.label .. "». Зачислено: " .. fmt(r.gain) .. " " .. CONFIG.CURRENCY, true)
+  end
+  flash("Принято " .. moved .. " шт. «" .. e.label .. "» (" .. fmt(round2(moved * e.price)) .. " " .. CONFIG.CURRENCY ..
+        "), но зачисление задержалось. Оно сохранено и будет завершено автоматически при следующем входе.", false)
 end
 
 local function doRefresh()
@@ -2001,6 +2577,8 @@ local function doWithdraw(q)
   if round2(p.balance) < cost then
     return flash("Не хватает средств: нужно " .. fmt(cost) .. ", на балансе " .. fmt(p.balance) .. ".", false)
   end
+  local pf, pfWhy = Net.preflight(status)
+  if not pf then return flash(pfWhy, false) end
   status("Проверяю наличие в ME...")
   local real = meCount(w.name, w.damage, w.var)
   if real == nil then return flash("ME-сеть недоступна. Попробуйте позже.", false) end
@@ -2015,6 +2593,7 @@ local function doWithdraw(q)
                customLabel = w.customLabel, qty = q }
   local pu = { id = Net.newPurchaseId(), kit = "Вывод", items = { it } }
   p.purchases[#p.purchases + 1] = pu
+  Net.log("withdraw", p.name, "Вывод #" .. pu.id .. ": " .. w.label .. " x" .. q, -cost, p.balance)
   if MODE == "terminal" then
     local okc, why = Net.commitPlayer(p, { { key = k, real = real } })
     if not okc then return flash(why, false) end
@@ -2386,14 +2965,15 @@ end
 local function subBar()
   local unread = unreadFeedback()
   local subs = { { "kits", "Комплекты" }, { "topup", "Ресурсы пополнения" }, { "withdraw", "Вывод" },
-                 { "feedback", "Отзывы" .. (unread > 0 and (" (" .. unread .. ")") or "") } }
+                 { "feedback", "Отзывы" .. (unread > 0 and (" (" .. unread .. ")") or "") },
+                 { "journal", "Журнал" }, { "balances", "Балансы" } }
   local exitW, gap = 14, 1
-  local region = (W - 2) - exitW - gap            -- ширина под три вкладки (колонки 2 .. W-1-exitW-gap)
-  local bw = math.floor((region - gap * 3) / 4)
+  local region = (W - 2) - exitW - gap            -- ширина под подвкладки (колонки 2 .. W-1-exitW-gap)
+  local bw = math.floor((region - gap * (#subs - 1)) / #subs)
   for i, s in ipairs(subs) do
     local on = (S.csub == s[1])
     addBtn(2 + (i - 1) * (bw + gap), 6, bw, 3, s[2],
-      { bg = on and C.blue or C.panel2, fn = function() nav({ csub = s[1], view = "list", filter = "" }) end })
+      { bg = on and C.blue or C.panel2, fn = function() nav({ csub = s[1], view = "list", filter = "", jview = "list" }) end })
   end
   local exitArmed = (S.confirm == "exit")
   rb(6, 0, exitW, exitArmed and "Точно?" or "Выход",
@@ -2578,13 +3158,179 @@ local function screenPick()
   end
 end
 
+---------------------------------------------------------- вкладки владельца: журнал и балансы
+UI.os = {}          -- экраны владельца лежат в таблице UI: свободных локальных переменных (лимит 200) не осталось
+UI.os.KINDS = { { "", "Все" }, { "buy", "Покупки" }, { "deposit", "Пополнения" }, { "withdraw", "Вывод" },
+                   { "claim", "Выдача" }, { "edit", "Правки" }, { "intent", "Намерения" } }
+UI.os.NAME  = { buy = "Покупка", deposit = "Пополнение", withdraw = "Вывод", claim = "Выдача",
+                   edit = "Правка", intent = "Намерение" }
+UI.os.CLR   = { buy = 0xdddddd, deposit = 0x68f029, withdraw = 0xf2b233, claim = 0x888888,
+                   edit = 0x66aaff, intent = 0xff5555 }
+
+function UI.os.errText(e) return (tostring(e):gsub("^.-USERMSG:", "")) end
+
+-- журнал операций: одна строка = одна запись, новые сверху
+function UI.os.journal()
+  S.jk = S.jk or 1
+  local kind = UI.os.KINDS[S.jk]
+  local ok, list, intents = pcall(Net.jView, S.jf or "", S.jforce)
+  S.jforce = nil
+  local hasF = S.jf and S.jf ~= ""
+  addBtn(2, 10, 30, 3, hasF and ("Ник: " .. S.jf) or "Фильтр по нику", { bg = hasF and C.blue or C.panel2, fn = function()
+    local v = prompt("Показать записи игрока (часть ника, пусто - все):", S.jf or "", 32)
+    if v == nil then return render() end
+    S.jf, S.page, S.jforce = trim(v), 1, true
+    render()
+  end })
+  addBtn(34, 10, 24, 3, "Тип: " .. kind[2], { fn = function()
+    S.jk = S.jk % #UI.os.KINDS + 1; S.page = 1; render()
+  end })
+  addBtn(60, 10, 20, 3, "Обновить", { bg = C.green, fn = function() S.jforce = true; render() end })
+  local nI = ok and #intents or 0
+  addBtn(82, 10, 34, 3, "Незавершённые зачисления: " .. nI, { bg = nI > 0 and C.red or C.panel2,
+    fn = function() nav({ jview = "intents" }) end })
+  if not ok then
+    text(2, SUB_Y, pad("Не удалось загрузить журнал: " .. UI.os.errText(list), W - 2), C.red, C.bg)
+    return
+  end
+
+  local rows = {}
+  for i = #list, 1, -1 do
+    local e = list[i]
+    if kind[1] == "" or e.kind == kind[1] then rows[#rows + 1] = e end
+  end
+  local dx, bx = W - 26, W - 13                     -- колонки «изменение» и «баланс»
+  local tw = dx - 45
+  text(3, SUB_Y - 1, pad("Время", 11) .. pad("Игрок", 17) .. pad("Тип", 13) .. pad("Что произошло", tw), C.dim, C.bg)
+  text(dx, SUB_Y - 1, pad("Изменение", 12), C.dim, C.bg)
+  text(bx, SUB_Y - 1, pad("Баланс", 11), C.dim, C.bg)
+  if #rows == 0 then text(2, SUB_Y, "Записей пока нет.", C.dim, C.bg) end
+
+  local per = math.max(1, H - 3 - UI.oy - SUB_Y)    -- по одной строке на запись
+  local pages = math.max(1, math.ceil(#rows / per))
+  if S.page > pages then S.page = pages end
+  if S.page < 1 then S.page = 1 end
+  S.pages = pages
+  local first = (S.page - 1) * per + 1
+  for i = first, math.min(#rows, first + per - 1) do
+    local e = rows[i]
+    local y = SUB_Y + (i - first)
+    local bg = ((i - first) % 2 == 0) and C.panel or C.bg
+    fill(2, y, W - 2, 1, bg)
+    text(3, y, pad(dateStr(e.time), 11), C.dim, bg)
+    text(14, y, pad(e.player, 17), C.text, bg)
+    text(31, y, pad(UI.os.NAME[e.kind] or e.kind, 13), UI.os.CLR[e.kind] or C.text, bg)
+    local what = e.text .. (e.by and ("  [" .. e.by .. "]") or "")
+    text(44, y, pad(what, tw), C.text, bg)
+    local d = tonumber(e.delta) or 0
+    text(dx, y, pad((d > 0 and "+" or "") .. fmt(d), 12), d > 0 and C.accent or (d < 0 and C.gold or C.dim), bg)
+    text(bx, y, pad(e.bal and fmt(e.bal) or "-", 11), C.dim, bg)
+  end
+end
+
+-- намерения пополнения, которые не удалось довести до зачисления
+function UI.os.intents()
+  S.backFn = function() nav({ jview = "list" }) end
+  local ok, _, intents = pcall(Net.jView, S.jf or "", true)
+  text(2, 6, "Незавершённые зачисления пополнений", C.accent, C.bg)
+  text(2, 8, "pending - пополнение идёт прямо сейчас. unknown - предметы могли уйти в ME, но результат не подтверждён.", C.dim, C.bg)
+  if not ok then text(2, LIST_Y, pad("Не удалось загрузить: " .. UI.os.errText(_), W - 2), C.red, C.bg); return end
+  local list = {}
+  for _, it in ipairs(intents) do list[#list + 1] = it end
+  local first, last = paged(#list, LIST_Y)
+  if #list == 0 then text(2, LIST_Y, "Всё зачислено, незавершённых пополнений нет.", C.dim, C.bg) end
+  local reserve = BW + 2
+  for i = first, last do
+    local it = list[i]
+    local y = LIST_Y + (i - first) * 4
+    card(y, "#" .. it.id .. "  " .. it.player .. "  [" .. tostring(it.state) .. "]  " .. dateStr(it.time),
+         it.label .. ": хотели внести " .. fmt(it.want) .. " шт по " .. fmt(it.price) .. " " .. CONFIG.CURRENCY ..
+         ". Проверьте вручную; при необходимости начислите во вкладке «Балансы».",
+         it.state == "unknown" and C.gold or C.dim, reserve)
+    local armed = (S.confirm == "drop" .. it.id)
+    rb(y, 0, BW, armed and "Точно закрыть?" or "Закрыть", { bg = armed and C.red or C.panel2, fn = function()
+      if S.confirm == "drop" .. it.id then
+        S.confirm = nil
+        local r = Net.doDrop(S.player.name, it.id)
+        if r.err then return flash("Не удалось закрыть: " .. tostring(r.err), false) end
+        flash("Намерение закрыто (записано в журнал).", true)
+      else S.confirm = "drop" .. it.id; render() end
+    end })
+  end
+end
+
+-- правка баланса: mode "set" - установить, "add" - прибавить/убавить
+function UI.os.adjust(e, mode)
+  local title = (mode == "set") and ("Новый баланс для " .. e.name .. ":")
+                or ("Изменить баланс " .. e.name .. " на (+ или -):")
+  local v = prompt(title, mode == "set" and fmt(e.balance) or "", 12)
+  if v == nil then return render() end
+  v = trim((v:gsub(",", ".")))
+  local sign, num = v:match("^([+-]?)(%d+%.?%d*)$")
+  local n = num and tonumber(num)
+  if not n or n > 10000000 or (mode == "set" and sign == "-") then
+    return flash("Введите число, например 150 или -20.", false)
+  end
+  if sign == "-" then n = -n end
+  if mode == "add" and round2(n) == 0 then return render() end
+  local why = prompt("Причина правки (обязательно, попадёт в журнал):", "", 80)
+  if why == nil then return render() end
+  why = trim(why)
+  if unicode.len(why) < 3 then return flash("Причина обязательна (минимум 3 символа). Баланс не изменён.", false) end
+  local r = Net.doAdjust(S.player.name, e.name, mode, n, why)
+  if r.err then
+    local m = { noplayer = "Игрок не найден.", neg = "Баланс не может стать отрицательным.",
+                big = "Слишком большой баланс.", noreason = "Причина обязательна.", forbidden = "Недостаточно прав.",
+                save = "Сервер не смог сохранить данные. Баланс не изменён." }
+    return flash(m[r.err] or ("Ошибка: " .. tostring(r.err)), false)
+  end
+  S.pforce, S.jforce = true, true
+  flash("Баланс " .. e.name .. ": " .. fmt(r.old) .. " -> " .. fmt(r.bal) .. " " .. CONFIG.CURRENCY ..
+        " (записано в журнал).", true)
+end
+
+function UI.os.balances()
+  local ok, list = pcall(Net.pView, S.pf or "", S.pforce)
+  S.pforce = nil
+  local hasF = S.pf and S.pf ~= ""
+  addBtn(2, 10, 30, 3, hasF and ("Ник: " .. S.pf) or "Поиск по нику", { bg = hasF and C.blue or C.panel2, fn = function()
+    local v = prompt("Часть ника игрока (пусто - все):", S.pf or "", 32)
+    if v == nil then return render() end
+    S.pf, S.page, S.pforce = trim(v), 1, true
+    render()
+  end })
+  addBtn(34, 10, 20, 3, "Обновить", { bg = C.green, fn = function() S.pforce = true; render() end })
+  text(56, 11, "Любая правка баланса записывается в журнал операций.", C.dim, C.bg)
+  if not ok then
+    text(2, SUB_Y, pad("Не удалось загрузить игроков: " .. UI.os.errText(list), W - 2), C.red, C.bg)
+    return
+  end
+  local first, last = paged(#list, SUB_Y)
+  if #list == 0 then text(2, SUB_Y, "Игроков не найдено.", C.dim, C.bg) end
+  local reserve = BW2 * 2 + 1 + 2
+  for i = first, last do
+    local e = list[i]
+    local y = SUB_Y + (i - first) * 4
+    lineCard(y, e.name, "Баланс: " .. fmt(e.balance) .. " " .. CONFIG.CURRENCY ..
+                        "   Незабранных позиций: " .. e.pend, C.text, reserve)
+    local off = rb(y, 0, BW2, "+ / -", { fn = function() UI.os.adjust(e, "add") end })
+    rb(y, off, BW2, "Установить", { bg = C.tabOn, fn = function() UI.os.adjust(e, "set") end })
+  end
+end
+
 local function screenCreate()
   if S.view == "edit" and screenKitEdit() then return end
   if S.view == "pick" then return screenPick() end
   S.view = "list"
   subBar()
 
-  if S.csub == "kits" then
+  if S.csub == "journal" then
+    if S.jview == "intents" then UI.os.intents() else UI.os.journal() end
+
+  elseif S.csub == "balances" then
+    UI.os.balances()
+
+  elseif S.csub == "kits" then
     addBtn(2, 10, 28, 3, "+ Новый комплект", { bg = C.tabOn, fn = function()
       local nm = prompt("Название нового комплекта:", "", 40)
       if nm and trim(nm) ~= "" then
@@ -2738,6 +3484,10 @@ local function onPlayerOn(e)
     end
     S.player.owner = r.owner
   end
+  -- незавершённые зачисления пополнений: сначала пробуем довести до конца (до чтения записи игрока)
+  if MODE ~= "terminal" then pcall(Net.iSweep, name) end
+  local okR, retried, gained = pcall(Net.outboxRetry, name)
+  if not okR then retried, gained = 0, 0 end
   local p = getPlayer(S.player.name)
   purgePurchases(p)
   local ok, err = scanME(S.player.name, S.player.owner)   -- единственное сканирование на входе
@@ -2745,6 +3495,8 @@ local function onPlayerOn(e)
   if not ok then
     -- технический текст ошибки видит только владелец
     flash("ME недоступна." .. (S.player.owner and (" " .. tostring(err)) or ""), false)
+  elseif gained and gained > 0 then
+    flash("Завершено прерванное пополнение: зачислено " .. fmt(gained) .. " " .. CONFIG.CURRENCY .. ".", true)
   elseif pendingCount(p) > 0 then
     flash("У вас есть незабранные ресурсы - кнопка «Незабранное» вверху справа.", true)
   elseif S.player.owner and unreadFeedback() > 0 then
@@ -2797,7 +3549,10 @@ local function reportError(err)
   -- лог не должен разрастаться: больше 100 КБ - начинаем заново
   local okSize, logSize = pcall(fs.size, CONFIG.LOG_PATH)
   local f = io.open(CONFIG.LOG_PATH, (okSize and (tonumber(logSize) or 0) > 102400) and "w" or "a")
-  if f then f:write(tostring(os.time()) .. " " .. err:sub(1, 2000) .. "\n"); f:close() end
+  if f then
+    pcall(f.write, f, tostring(os.time()) .. " " .. (err:gsub("%s*\n%s*", " | ")):sub(1, 2000) .. "\n")
+    pcall(f.close, f)                  -- закрываем всегда, даже если запись упала
+  end
   local now = computer.uptime()
   if db and now - lastAutoReport > 10 then
     lastAutoReport = now
@@ -2819,10 +3574,32 @@ local function reportError(err)
   end
 end
 
+Net.reportError = reportError      -- сетевому слою (он объявлен раньше) нужен доступ к записи ошибок
+
 ----------------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------------
 local startupPrepared = false     -- подготовку базы делаем один раз за запуск, а не при каждом перезапуске main
+
+-- При запуске: если после прошлой записи в «Отзывы» в error.log появилась новая ошибка, сообщаем владельцу
+-- «Сервер запущен заново. Последняя ошибка: ...» (так видно перезапуск и его причину).
+function Net.bootNote()
+  local f = io.open(CONFIG.LOG_PATH, "r")
+  if not f then return end
+  local lastT, lastMsg
+  pcall(function()
+    for line in f:lines() do
+      local t, msg = line:match("^([%d%.]+) (.*)$")
+      if t then lastT, lastMsg = tonumber(t), msg end
+    end
+  end)
+  pcall(f.close, f)
+  if not lastT or lastT <= (db.lastErrNoted or 0) then return end
+  db.lastErrNoted = lastT
+  db.feedback[#db.feedback + 1] = { player = "[сервер]", time = os.time(), read = false,
+    text = unicode.sub("Запущено заново. Последняя ошибка (" .. dateStr(lastT) .. "): " .. tostring(lastMsg), 1, 300) }
+  while #db.feedback > CONFIG.FEEDBACK_KEEP do table.remove(db.feedback, 1) end
+end
 
 -- подготовка авторитетной базы (одиночный режим и сервер)
 function Net.prepareDB()
@@ -2854,6 +3631,14 @@ function Net.prepareDB()
     end
     for _, key in ipairs(drop) do db.players[key] = nil end
   end
+  Net.iSweep(nil)      -- намерения пополнения, прерванные до подтверждения: на проверку владельцу
+  -- старая база хранила журнал внутри себя: переносим записи в файл журнала (он допишется после сохранения базы)
+  if type(db.journal) == "table" then
+    local old = db.journal
+    db.journal = nil
+    for i = #old, 1, -1 do table.insert(Net.jPending, 1, old[i]) end
+  end
+  pcall(Net.bootNote)
   pcall(saveDB)
   ru.unload()        -- словарь нужен был только для этого перевода; дальше грузится лениво, у владельца
 end
@@ -2892,11 +3677,13 @@ local function main()
   if MODE == "server" then return Net.serverMain() end
   if MODE == "terminal" then
     db = { owners = {}, ownerUids = {}, kits = {}, nextKitId = 1, topup = {}, players = {}, feedback = {},
-           nextPurchaseId = 1, withdraw = false }
+           nextPurchaseId = 1, withdraw = false, intents = {} }
     modem.open(CONFIG.NET_PORT + 1)
     if not Net.call("hello", {}, 1) then
       print("ВНИМАНИЕ: сервер магазина не отвечает (порт " .. CONFIG.NET_PORT .. "). Проверьте сервер, кабель и NET_KEY.")
     end
+    local okR, n = pcall(Net.outboxRetry)
+    if okR and n > 0 then print("Дозачислено прерванных пополнений: " .. n) end
   else
     db = loadDB()
     Net.prepareDB()
@@ -2904,6 +3691,8 @@ local function main()
       print("ВНИМАНИЕ: владелец не задан. Остановите программу и выполните:")
       print("  lua kitshop.lua owner add ВашНик")
     end
+    local okR, n = pcall(Net.outboxRetry)
+    if okR and n > 0 then print("Дозачислено прерванных пополнений: " .. n) end
   end
   pcall(gpu.setResolution, CONFIG.SCREEN_W, CONFIG.SCREEN_H)
   W, H = gpu.getResolution()
