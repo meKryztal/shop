@@ -591,6 +591,58 @@ function Net.jList(filter)
   return out, db.intents or {}
 end
 
+-- Незабранные позиции игрока (для владельца): покупки и комплекты, оплаченные, но не выданные
+function Net.pendGet(who, name)
+  if not isOwner(tostring(who)) then return { err = "forbidden" } end
+  local p = db.players[lower(tostring(name))]
+  if not p then return { err = "noplayer" } end
+  local list = {}
+  for _, pu in ipairs(p.purchases or {}) do
+    local items = {}
+    for i, it in ipairs(pu.items or {}) do
+      if (tonumber(it.qty) or 0) > 0 then
+        items[#items + 1] = { idx = i, label = tostring(it.label or it.name or "?"), qty = it.qty }
+      end
+    end
+    if #items > 0 then list[#list + 1] = { id = pu.id, kit = tostring(pu.kit or "?"), items = items } end
+  end
+  return { ok = true, name = p.name, bal = round2(tonumber(p.balance) or 0), list = list }
+end
+
+-- Изменить остаток незабранной позиции (только уменьшить; 0 - убрать позицию). Причина обязательна, запись
+-- идёт в журнал. Деньги не возвращаются сами: при необходимости начислите их вкладкой «Балансы» (+ / -).
+function Net.pendEdit(who, name, pid, idx, qty, reason)
+  if not isOwner(tostring(who)) then return { err = "forbidden" } end
+  reason = trim(tostring(reason or "")):gsub("%s+", " ")
+  if unicode.len(reason) < 3 then return { err = "noreason" } end
+  reason = unicode.sub(reason, 1, 60)
+  local p = db.players[lower(tostring(name))]
+  if not p then return { err = "noplayer" } end
+  local pu, pidx = findPurchase(p, tonumber(pid))
+  local it = pu and pu.items[tonumber(idx) or 0]
+  if not it or (tonumber(it.qty) or 0) <= 0 then return { err = "gone" } end     -- уже забрали или изменили
+  qty = math.floor(tonumber(qty) or -1)
+  local old = it.qty
+  if qty < 0 or qty > old then return { err = "badqty" } end
+  if qty == old then return { ok = true, old = old, qty = qty } end
+  local oldRev = p.rev
+  local removed = false
+  it.qty, p.rev = qty, (p.rev or 0) + 1
+  if purchasePending(pu) == 0 then table.remove(p.purchases, pidx); removed = true end
+  local ent = Net.jAdd({ kind = "edit", player = p.name, delta = 0, by = who,
+                         text = "Незабранное #" .. tostring(pu.id) .. ": " .. tostring(it.label or it.name) ..
+                                " " .. old .. " -> " .. qty .. ". Причина: " .. reason })
+  local ok, err = Net.trySave()
+  if not ok then
+    it.qty, p.rev = old, oldRev
+    if removed then table.insert(p.purchases, pidx, pu) end
+    Net.jUndo(ent)
+    print("pendEdit: не удалось сохранить базу: " .. tostring(err))
+    return { err = "save" }
+  end
+  return { ok = true, old = old, qty = qty }
+end
+
 function Net.pList(filter)
   local out = {}
   filter = lower(filter or "")
@@ -924,6 +976,8 @@ SRV.players = function(a)
 end
 
 SRV.adjust = function(a) return Net.adjustBalance(a.who, a.name, a.mode, a.value, a.reason) end
+SRV.pend = function(a) return Net.pendGet(a.who, a.name) end
+SRV.pendEdit = function(a) return Net.pendEdit(a.who, a.name, a.pid, a.idx, a.qty, a.reason) end
 
 -- журнал намерений пополнения
 SRV.intentNew = function(a)
@@ -991,7 +1045,7 @@ end
 
 -- команды, ответ на которые кэшируется: повтор запроса (потерялся ответ) не должен выполнить его дважды
 local IDEMPOTENT = { pushPlayer = true, allocId = true, fbAdd = true, fbOp = true, pushConfig = true, owner = true,
-                     adjust = true, intentNew = true, intentDone = true, intentDrop = true }
+                     adjust = true, pendEdit = true, intentNew = true, intentDone = true, intentDrop = true }
 local srvBox, replyCache, replyOrder = {}, {}, {}
 
 local seenTerm, lastBadKey = {}, -100
@@ -1286,6 +1340,24 @@ function Net.doAdjust(who, name, mode, value, reason)
     if r.ok and db.players[lower(name)] then pcall(Net.pullPlayer, name) end
   else
     r = Net.adjustBalance(who, name, mode, value, reason)
+  end
+  Net.jc, Net.pc = nil, nil
+  return r
+end
+
+-- незабранные позиции игрока для экрана владельца (без кэша: экран сам решает, когда перечитать)
+function Net.pendView(who, name)
+  if MODE == "terminal" then return Net.req("pend", { who = who, name = name }) end
+  return Net.pendGet(who, name)
+end
+
+function Net.doPendEdit(who, name, pid, idx, qty, reason)
+  local r
+  if MODE == "terminal" then
+    r = Net.try("pendEdit", { who = who, name = name, pid = pid, idx = idx, qty = qty, reason = reason }, 4)
+    if r.ok and db.players[lower(name)] then pcall(Net.pullPlayer, name) end   -- игрок на этом терминале: свежая запись
+  else
+    r = Net.pendEdit(who, name, pid, idx, qty, reason)
   end
   Net.jc, Net.pc = nil, nil
   return r
@@ -2794,7 +2866,7 @@ local function idleTick()
 end
 
 local function switchTab(t)
-  S.tab = t; S.view = "list"; S.csub = "kits"; S.page = 1
+  S.tab = t; S.view = "list"; S.csub = "kits"; S.page = 1; S.pview = false
   S.msg = ""; S.confirm = nil; S.filter = ""
   if #cache.items > 0 then cache.items = {}; ru.unload() end     -- ушли из окна выбора: освобождаем
   if t == "topup" then scanInventory() end
@@ -2973,7 +3045,7 @@ local function subBar()
   for i, s in ipairs(subs) do
     local on = (S.csub == s[1])
     addBtn(2 + (i - 1) * (bw + gap), 6, bw, 3, s[2],
-      { bg = on and C.blue or C.panel2, fn = function() nav({ csub = s[1], view = "list", filter = "", jview = "list" }) end })
+      { bg = on and C.blue or C.panel2, fn = function() nav({ csub = s[1], view = "list", filter = "", jview = "list", pview = false }) end })
   end
   local exitArmed = (S.confirm == "exit")
   rb(6, 0, exitW, exitArmed and "Точно?" or "Выход",
@@ -3289,7 +3361,70 @@ function UI.os.adjust(e, mode)
         " (записано в журнал).", true)
 end
 
+-- незабранные позиции выбранного игрока: смотреть, уменьшать остаток, убирать
+function UI.os.pending()
+  local name = S.pview
+  S.backFn = function() nav({ pview = false, pdata = false, pforce = true }) end
+  if S.pdNeed or not S.pdata or S.pdata.name ~= name then
+    local ok, r = pcall(Net.pendView, S.player.name, name)
+    S.pdNeed = nil
+    if ok and r and r.ok then S.pdata, S.pderr = r, nil
+    else S.pdata, S.pderr = nil, ok and tostring(r and r.err) or UI.os.errText(r) end
+  end
+  text(2, 10, pad("Незабранные позиции игрока " .. name, W - 2), C.accent, C.bg)
+  text(2, 12, pad("Деньги за убранную позицию сами не возвращаются: начислите их во вкладке «Балансы» (+ / -).", W - 2),
+       C.dim, C.bg)
+  if not S.pdata then
+    text(2, SUB_Y, pad("Не удалось загрузить: " .. tostring(S.pderr), W - 2), C.red, C.bg)
+    return
+  end
+  local flat = {}
+  for _, pu in ipairs(S.pdata.list) do
+    for _, it in ipairs(pu.items) do flat[#flat + 1] = { pu = pu, it = it } end
+  end
+  local first, last = paged(#flat, SUB_Y)
+  if #flat == 0 then text(2, SUB_Y, "Незабранных позиций нет.", C.dim, C.bg) end
+  local reserve = BW2 * 2 + 1 + 2
+  local function apply(row, qty, why)
+    local r = Net.doPendEdit(S.player.name, name, row.pu.id, row.it.idx, qty, why)
+    S.pdNeed, S.pforce = true, true
+    if r.err then
+      local m = { noreason = "Причина обязательна.", gone = "Позиция уже изменилась (игрок мог её забрать). Список обновлён.",
+                  badqty = "Можно только уменьшить остаток.", noplayer = "Игрок не найден.",
+                  forbidden = "Недостаточно прав.", save = "Сервер не смог сохранить данные. Ничего не изменено." }
+      return flash(m[r.err] or ("Ошибка: " .. tostring(r.err)), false)
+    end
+    flash(row.it.label .. ": " .. r.old .. " -> " .. r.qty .. " (записано в журнал).", true)
+  end
+  local function askWhy()
+    local why = prompt("Причина (обязательно, попадёт в журнал):", "", 60)
+    if why == nil then return nil end
+    why = trim(why)
+    if unicode.len(why) < 3 then flash("Причина обязательна (минимум 3 символа). Ничего не изменено.", false); return nil end
+    return why
+  end
+  for i = first, last do
+    local row = flat[i]
+    local y = SUB_Y + (i - first) * 4
+    card(y, "#" .. row.pu.id .. "  " .. row.pu.kit, row.it.label .. ": осталось выдать " .. row.it.qty, C.gold, reserve)
+    local off = rb(y, 0, BW2, "Убрать", { bg = C.red, fn = function()
+      local why = askWhy(); if why then apply(row, 0, why) end
+    end })
+    rb(y, off, BW2, "Изменить", { bg = C.tabOn, fn = function()
+      local v = prompt("Сколько оставить к выдаче (0-" .. row.it.qty .. "):", tostring(row.it.qty), 8)
+      if v == nil then return render() end
+      local n = tonumber(trim(v))
+      if not n or n < 0 or n > row.it.qty or n ~= math.floor(n) then
+        return flash("Введите целое число от 0 до " .. row.it.qty .. ".", false)
+      end
+      if n == row.it.qty then return render() end
+      local why = askWhy(); if why then apply(row, n, why) end
+    end })
+  end
+end
+
 function UI.os.balances()
+  if S.pview then return UI.os.pending() end
   local ok, list = pcall(Net.pView, S.pf or "", S.pforce)
   S.pforce = nil
   local hasF = S.pf and S.pf ~= ""
@@ -3307,14 +3442,16 @@ function UI.os.balances()
   end
   local first, last = paged(#list, SUB_Y)
   if #list == 0 then text(2, SUB_Y, "Игроков не найдено.", C.dim, C.bg) end
-  local reserve = BW2 * 2 + 1 + 2
+  local reserve = BW2 * 3 + 2 + 2
   for i = first, last do
     local e = list[i]
     local y = SUB_Y + (i - first) * 4
     lineCard(y, e.name, "Баланс: " .. fmt(e.balance) .. " " .. CONFIG.CURRENCY ..
                         "   Незабранных позиций: " .. e.pend, C.text, reserve)
     local off = rb(y, 0, BW2, "+ / -", { fn = function() UI.os.adjust(e, "add") end })
-    rb(y, off, BW2, "Установить", { bg = C.tabOn, fn = function() UI.os.adjust(e, "set") end })
+    off = rb(y, off, BW2, "Установить", { bg = C.tabOn, fn = function() UI.os.adjust(e, "set") end })
+    rb(y, off, BW2, "Позиции: " .. e.pend, { disabled = (e.pend or 0) == 0, bg = C.gold, fg = 0x000000,
+      fn = function() nav({ pview = e.name, pdNeed = true, pdata = false }) end })
   end
 end
 
@@ -3731,7 +3868,9 @@ local function main()
     if pendingOff then pendingOff = false; pcall(onPlayerOff) end
   end
 
-  event.shouldInterrupt, event.shouldSoftInterrupt = ORIG_INT, ORIG_SOFT
+  -- возвращаем оригинальные обработчики; если их не было (nil), оставляем заглушку: OpenOS вызывает их без проверки
+  event.shouldInterrupt = ORIG_INT or function() return false end
+  event.shouldSoftInterrupt = ORIG_SOFT or function() return false end
   gpu.setBackground(0x000000); gpu.setForeground(0xFFFFFF)
   gpu.fill(1, 1, W, H, " ")
   print("KitShop остановлен.")
