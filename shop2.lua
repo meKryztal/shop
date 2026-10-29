@@ -1,4 +1,30 @@
+--[[
+  KitShop - магазин КОМПЛЕКТОВ для OpenComputers + OpenPeripheral PIM + AE2 ME Interface
 
+  Игрок встаёт на PIM -> авторизация -> одно сканирование ME -> три вкладки
+  (у владельца) или две (у клиента):
+    Квесты/Комплекты | Пополнение | Создание (только владелец)
+
+  Всё хранится в файле базы (CONFIG.DB_PATH): балансы, покупки,
+  незабранные ресурсы, комплекты, ресурсы пополнения, отзывы.
+
+  РЕЖИМЫ (CONFIG.MODE):
+    standalone - один ПК, всё как раньше (по умолчанию);
+    server     - ПК-сервер: хранит базу и отвечает терминалам по сети (экран, PIM и ME не нужны);
+    terminal   - ПК-терминал: PIM + ME Interface + экран + сетевая карта; базы у него нет,
+                 все данные берёт у сервера. Терминалов можно ставить сколько угодно.
+
+  ЖУРНАЛ ОПЕРАЦИЙ (владелец: «Создание» -> «Журнал», рядом с «Отзывами»): покупки, пополнения, вывод,
+  выдача, правки владельца; фильтр по нику и типу. Вкладка «Балансы»: поиск игрока и правка баланса
+  (установить / прибавить-убавить), каждая правка пишется в журнал с ником владельца.
+
+  ЖУРНАЛ НАМЕРЕНИЙ ПОПОЛНЕНИЯ: перед тем как забрать предметы, записывается намерение (ник, предмет, цена,
+  количество). Зачисление атомарное и идемпотентное; если не прошло (обрыв связи, сбой диска), оно
+  повторяется при следующем входе игрока или запуске программы (файл CONFIG.OUTBOX_PATH). Подробнее - в
+  комментарии над функцией Net.jAdd.
+
+  Экран рассчитан на 160x50 (подстраивается под реальное разрешение).
+]]
 
 local component = require("component")
 local computer  = require("computer")
@@ -2413,6 +2439,7 @@ local function pushFromSlot(s, take, name, damage)
       local ok, res = pcall(pim.pushItem, variant, s, take)
       if ok then
         local after = slotQty(s, name, damage)
+        if after == nil then os.sleep(0.1); after = slotQty(s, name, damage) end   -- чтение могло мигнуть
         if after and before - after > 0 then
           pushSideOk = variant      -- запомнили рабочую сторону
           return before - after
@@ -2449,19 +2476,33 @@ local function doDeposit(e, amount)
 
   status("Принимаю ресурсы...")
   lastPushErr = nil
-  local left = want
+  -- Между первым чтением инвентаря и этим местом прошли запросы к серверу (секунды): игрок мог переложить
+  -- предметы (например, в переносную ячейку). Поэтому читаем инвентарь ЗАНОВО и работаем только с ним.
+  local fresh = readSlots()
+  local unreadable = false
+  for s = 1, 36 do if fresh[s] == nil then unreadable = true end end
+  local haveNow = countIn(fresh, e.name, e.damage, e.var)
+  local wantNow = math.min(want, haveNow)
+  if unreadable or wantNow <= 0 then
+    pcall(Net.depositEnd, iid, 0, S.player.name)            -- ничего не трогали: намерение отменяем
+    S.slots = readSlots()
+    return flash(unreadable and "Не удалось прочитать инвентарь (встаньте на PIM и повторите)."
+                 or "Предметы пропали из инвентаря до приёма. Пополнение отменено.", false)
+  end
+  -- Засчитываем ТОЛЬКО то, что реально передал pushItem (сумма по слотам), а не «разницу в инвентаре»:
+  -- иначе всё, что игрок убрал сам, выглядело бы как внесённое в ME.
+  local left, moved = wantNow, 0
   for s = 1, 36 do
     if left <= 0 then break end
-    local st = before[s]
+    local st = fresh[s]
     if stackMatches(st, e.name, e.damage, e.var) then
-      left = left - pushFromSlot(s, math.min(st.qty, left), e.name, e.damage)
+      local n = pushFromSlot(s, math.min(st.qty, left), e.name, e.damage)
+      left = left - n
+      moved = moved + n
     end
   end
-
-  local afterSlots = readSlots()
-  local after = countIn(afterSlots, e.name, e.damage, e.var)
-  local moved = math.max(0, math.min(want, have - after))
-  S.slots = afterSlots
+  moved = math.min(moved, wantNow)
+  S.slots = readSlots()
   if moved <= 0 then
     pcall(Net.depositEnd, iid, 0, S.player.name)           -- ничего не ушло: намерение отменяем
     local msg = "Не удалось принять предметы. Проверьте подключение ME Interface к PIM и свободное место в ME."
