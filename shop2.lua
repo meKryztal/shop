@@ -1,4 +1,30 @@
+--[[
+  KitShop - магазин КОМПЛЕКТОВ для OpenComputers + OpenPeripheral PIM + AE2 ME Interface
 
+  Игрок встаёт на PIM -> авторизация -> одно сканирование ME -> три вкладки
+  (у владельца) или две (у клиента):
+    Квесты/Комплекты | Пополнение | Создание (только владелец)
+
+  Всё хранится в файле базы (CONFIG.DB_PATH): балансы, покупки,
+  незабранные ресурсы, комплекты, ресурсы пополнения, отзывы.
+
+  РЕЖИМЫ (CONFIG.MODE):
+    standalone - один ПК, всё как раньше (по умолчанию);
+    server     - ПК-сервер: хранит базу и отвечает терминалам по сети (экран, PIM и ME не нужны);
+    terminal   - ПК-терминал: PIM + ME Interface + экран + сетевая карта; базы у него нет,
+                 все данные берёт у сервера. Терминалов можно ставить сколько угодно.
+
+  ЖУРНАЛ ОПЕРАЦИЙ (владелец: «Создание» -> «Журнал», рядом с «Отзывами»): покупки, пополнения, вывод,
+  выдача, правки владельца; фильтр по нику и типу. Вкладка «Балансы»: поиск игрока и правка баланса
+  (установить / прибавить-убавить), каждая правка пишется в журнал с ником владельца.
+
+  ЖУРНАЛ НАМЕРЕНИЙ ПОПОЛНЕНИЯ: перед тем как забрать предметы, записывается намерение (ник, предмет, цена,
+  количество). Зачисление атомарное и идемпотентное; если не прошло (обрыв связи, сбой диска), оно
+  повторяется при следующем входе игрока или запуске программы (файл CONFIG.OUTBOX_PATH). Подробнее - в
+  комментарии над функцией Net.jAdd.
+
+  Экран рассчитан на 160x50 (подстраивается под реальное разрешение).
+]]
 
 local component = require("component")
 local computer  = require("computer")
@@ -1816,11 +1842,11 @@ local function stackInfo(st)
 end
 
 -- читает 36 слотов: slots[s] = false (пусто) | {name,damage,qty,max,var} | nil (ошибка чтения)
-local allStacksOk = nil          -- nil: ещё не проверяли; true/false: работает ли pim.getAllStacks
+-- Net.allStacksOk: nil - ещё не проверяли; true/false - работает ли pim.getAllStacks (не local: лимит 200 локальных)
 local function readSlots()
   local slots = {}
   -- быстрый путь: один вызов вместо 36 (каждый вызов компонента стоит тик, ~1.8 с на весь инвентарь)
-  if allStacksOk ~= false and pim.getAllStacks then
+  if Net.allStacksOk ~= false and pim.getAllStacks then
     local ok, all = pcall(pim.getAllStacks)
     if ok and type(all) == "table" and next(all) ~= nil then
       for s = 1, 36 do
@@ -1832,10 +1858,10 @@ local function readSlots()
           slots[s] = false
         end
       end
-      allStacksOk = true
+      Net.allStacksOk = true
       return slots
     end
-    if not ok then allStacksOk = false end        -- метода нет / падает: дальше читаем по слотам
+    if not ok then Net.allStacksOk = false end        -- метода нет / падает: дальше читаем по слотам
   end
   for s = 1, 36 do
     local ok, st = pcall(pim.getStackInSlot, s)
