@@ -1,92 +1,40 @@
---[[
-  KitShop - магазин КОМПЛЕКТОВ для OpenComputers + OpenPeripheral PIM + AE2 ME Interface
-
-  Игрок встаёт на PIM -> авторизация -> одно сканирование ME -> три вкладки
-  (у владельца) или две (у клиента):
-    Квесты/Комплекты | Пополнение | Создание (только владелец)
-
-  Всё хранится в файле базы (CONFIG.DB_PATH): балансы, покупки,
-  незабранные ресурсы, комплекты, ресурсы пополнения, отзывы.
-
-  РЕЖИМЫ (CONFIG.MODE):
-    standalone - один ПК, всё как раньше (по умолчанию);
-    server     - ПК-сервер: хранит базу и отвечает терминалам по сети (экран, PIM и ME не нужны);
-    terminal   - ПК-терминал: PIM + ME Interface + экран + сетевая карта; базы у него нет,
-                 все данные берёт у сервера. Терминалов можно ставить сколько угодно.
-
-  ЖУРНАЛ ОПЕРАЦИЙ (владелец: «Создание» -> «Журнал», рядом с «Отзывами»): покупки, пополнения, вывод,
-  выдача, правки владельца; фильтр по нику и типу. Вкладка «Балансы»: поиск игрока и правка баланса
-  (установить / прибавить-убавить), каждая правка пишется в журнал с ником владельца.
-
-  ЖУРНАЛ НАМЕРЕНИЙ ПОПОЛНЕНИЯ: перед тем как забрать предметы, записывается намерение (ник, предмет, цена,
-  количество). Зачисление атомарное и идемпотентное; если не прошло (обрыв связи, сбой диска), оно
-  повторяется при следующем входе игрока или запуске программы (файл CONFIG.OUTBOX_PATH). Подробнее - в
-  комментарии над функцией Net.jAdd.
-
-  Экран рассчитан на 160x50 (подстраивается под реальное разрешение).
-]]
-
 local component = require("component")
 local computer  = require("computer")
 local event     = require("event")
 local fs        = require("filesystem")
 local ser       = require("serialization")
 local unicode   = require("unicode")
-
-local ARGS = { ... }               -- аргументы командной строки
-local SELF_SRC = debug.getinfo(1, "S").source   -- откуда загружен файл (нужно для автозапуска)
-
--- Оригинальные обработчики прерывания запоминаем ОДИН раз (до возможных перезапусков main)
+local ARGS = { ... }
+local SELF_SRC = debug.getinfo(1, "S").source
 local ORIG_INT, ORIG_SOFT = event.shouldInterrupt, event.shouldSoftInterrupt
-
-----------------------------------------------------------------------
--- НАСТРОЙКИ
-----------------------------------------------------------------------
 local CONFIG = {
-  OWNERS   = {},                    -- необязательно: ники прямо в файле.
-                                    -- Основной способ: lua kitshop.lua owner add Ник
-  CURRENCY = "coin",                  -- название валюты на экране
-
+  OWNERS   = {},
+  CURRENCY = "coin",
   DB_PATH  = "/home/kitshop/db.dat",
   LOG_PATH = "/home/kitshop/error.log",
-  CMD_PATH = "/home/kitshop/owner.cmd",   -- очередь команд owner add/del для запущенного сервера
-
-  -- Стороны.
-  ME_EXPORT_SIDE = "up",            -- откуда ME Interface выдаёт предметы (в сторону PIM)
-  PIM_PUSH_SIDE  = "north",         -- сторона для pim.pushItem (если не сработает, код переберёт остальные сам
-                                    -- и запомнит рабочую; впишите её сюда, когда узнаете)
-
-  REFRESH_COOLDOWN = 60,            -- кнопка "Обновить" не чаще раза в N секунд
-  SCREEN_W = 160, SCREEN_H = 50,     -- желаемое разрешение (подстроится под экран)
-
-  PICK_MAX = 300,                   -- сколько предметов ME показывать в списке выбора (дальше - поиском)
-
-  MEM_LOW = 500 * 1024,             -- порог свободной ОЗУ (байт): ниже него выгружаем лишнее (см. memGuard)
-
-  FEEDBACK_COOLDOWN = 30,           -- пауза между отзывами одного игрока, сек
+  CMD_PATH = "/home/kitshop/owner.cmd",
+  ME_EXPORT_SIDE = "up",
+  PIM_PUSH_SIDE  = "north",
+  REFRESH_COOLDOWN = 60,
+  SCREEN_W = 160, SCREEN_H = 50,
+  PICK_MAX = 300,
+  MEM_LOW = 500 * 1024,
+  FEEDBACK_COOLDOWN = 30,
   FEEDBACK_MAX_LEN  = 200,
-  FEEDBACK_KEEP     = 100,          -- сколько последних отзывов хранить
-
-  JOURNAL_KEEP      = 300,          -- сколько последних записей журнала операций показывать владельцу
-  JOURNAL_PATH      = "/home/kitshop/journal.log",  -- журнал операций: отдельный файл, только дописывается (на ПК с базой)
-  JOURNAL_MAX       = 400 * 1024,   -- больше этого размера (байт) файл уходит в journal.log.1, начинается новый
-  OUTBOX_PATH       = "/home/kitshop/outbox.dat",   -- незавершённые зачисления пополнений (на ПК с PIM)
-
-  -- Сеть (для режимов server / terminal). На ВСЕХ ПК значения NET_PORT и NET_KEY должны совпадать.
-  MODE        = "standalone",       -- "standalone" | "server" | "terminal"
-  NET_PORT    = 4747,               -- порт запросов к серверу (ответы идут на NET_PORT + 1)
-  NET_KEY     = "change-me",        -- общий пароль сети: ЗАМЕНИТЕ на свой
-  NET_TIMEOUT = 3,                  -- сколько секунд ждать ответ сервера
-  NET_RETRIES = 3,                  -- сколько раз повторять запрос
-  NET_CHUNK   = 6000,               -- размер куска сообщения, байт (пакет модема ограничен 8192)
+  FEEDBACK_KEEP     = 100,
+  JOURNAL_KEEP      = 300,
+  JOURNAL_PATH      = "/home/kitshop/journal.log",
+  JOURNAL_MAX       = 400 * 1024,
+  OUTBOX_PATH       = "/home/kitshop/outbox.dat",
+  MODE        = "standalone",
+  NET_PORT    = 4747,
+  NET_KEY     = "change-me",
+  NET_TIMEOUT = 3,
+  NET_RETRIES = 3,
+  NET_CHUNK   = 6000,
 }
-
 local MODE = CONFIG.MODE or "standalone"
 if ARGS[1] == "server" then MODE = "server" end
-
-----------------------------------------------------------------------
--- ОБОРУДОВАНИЕ
-----------------------------------------------------------------------
 local gpu, me, pim, modem
 if MODE ~= "server" then
   if not component.isAvailable("me_interface") then
@@ -105,19 +53,11 @@ if MODE ~= "standalone" then
   end
   modem = component.modem
 end
-local pendingOff = false      -- игрок ушёл с PIM во время длинной операции (см. сеть и диалоги)
-
--- Принудительная сборка мусора. В OpenComputers функции collectgarbage может не быть,
--- зато вызов computer.freeMemory() запускает сборку мусора (так её и принято вызывать).
--- Всё под pcall: если ничего не сработает, магазин просто продолжит работу.
+local pendingOff = false
 local gc = function()
   if type(collectgarbage) == "function" then pcall(collectgarbage)
   else pcall(computer.freeMemory) end
 end
-
--- Сторож памяти. Когда свободной ОЗУ меньше CONFIG.MEM_LOW, по очереди вызываются «освободители»
--- (от дешёвых к дорогим) и после каждого проверяется, хватило ли. Освободители регистрируются
--- ниже, рядом с тем кэшем, который они чистят. Возвращает true, если память была на исходе.
 local memReleasers = {}
 local function memGuard()
   local okf, free = pcall(computer.freeMemory)
@@ -130,19 +70,13 @@ local function memGuard()
   end
   return true
 end
-
--- Русские названия предметов: словарь "<id>&&<damage>" -> название (см. build_ru_from_nei.py).
--- Файл необязателен: без него названия остаются такими, как их отдаёт ME.
--- Словари делает nei_to_lua.py: ru_names.lua (предметы) и ru_extra.lua (виды, чары/зелья, обработчики).
--- Грузятся лениво и под pcall: нет файла или не хватило памяти - возвращается запасной текст.
 local ru = {}
 do
   local DIR = "/home/kitshop"
-  local SHARD_DIR = DIR .. "/ru_names"       -- папка с файлами по модам (делает split_ru_names.py)
-  local SHARD_KEEP = 3                       -- сколько файлов-модов держать в ОЗУ одновременно
+  local SHARD_DIR = DIR .. "/ru_names"
+  local SHARD_KEEP = 3
   local shards, shardCount = {}, 0
   local legacy, extra
-
   local function load(path)
     local ok, t = pcall(dofile, path)
     if ok and type(t) == "table" then return t end
@@ -152,7 +86,6 @@ do
     local mod = tostring(name):match("^([^:]+):") or "_"
     return (mod:gsub("[^%w_%-]", "_"))
   end
-  -- словарь одного мода (~несколько КБ вместо 300 КБ целиком)
   local function shardFor(name)
     local f = modFile(name)
     local t = shards[f]
@@ -169,11 +102,9 @@ do
     if useShards == nil then useShards = fs.isDirectory(SHARD_DIR) end
     return useShards
   end
-
   function ru.item(name, dmg, fb)
     local key = tostring(name) .. "&&" .. math.floor(tonumber(dmg) or 0)
     if sharded() then return shardFor(name)[key] or fb end
-    -- запасной вариант: папки ru_names/ нет, грузим старый общий файл целиком
     if not legacy then legacy = load(DIR .. "/ru_names.lua") end
     return legacy[key] or fb
   end
@@ -194,11 +125,7 @@ do
   end
 end
 local function ruName(name, dmg, fallback) return ru.item(name, dmg, fallback) end
-memReleasers[#memReleasers + 1] = function() ru.unload() end          -- 1) словари переводов
-
-----------------------------------------------------------------------
--- УТИЛИТЫ
-----------------------------------------------------------------------
+memReleasers[#memReleasers + 1] = function() ru.unload() end
 local function lower(s) return unicode.lower(tostring(s)) end
 local function trim(s) return (tostring(s):match("^%s*(.-)%s*$")) end
 local function round2(n) return math.floor(n * 100 + 0.5) / 100 end
@@ -207,14 +134,11 @@ local function fmt(n)
   if n == math.floor(n) then return string.format("%d", n) end
   return string.format("%.2f", n)
 end
--- var - «вариант» предмета (например, какая жидкость в баке). Пусто для обычных предметов.
 local function itemKey(name, dmg, var)
   local k = tostring(name) .. "&&" .. tostring(math.floor(tonumber(dmg) or 0))
   if var and var ~= "" then k = k .. "&&" .. tostring(var) end
   return k
 end
-
--- NBT-хеш предмета (если ME / PIM его отдают). Нужен, чтобы отличать предметы с одинаковыми id и damage.
 local function nbtOf(it)
   if type(it) ~= "table" then return nil end
   for _, k in ipairs({ "nbt_hash", "nbtHash", "hash", "nbt" }) do
@@ -223,9 +147,6 @@ local function nbtOf(it)
   end
   return nil
 end
-
--- Тип жидкости в предмете (только для отображения, без количества): "chocolatemilk".
--- Ищем в it.fluid (ME) и в it.fluid_container.contents (PIM).
 local function fluidVariant(it)
   local f = type(it) == "table" and it.fluid
   if type(f) ~= "table" then
@@ -246,18 +167,11 @@ local function fluidVariant(it)
   table.sort(parts)
   return table.concat(parts, ";")
 end
-
--- Вариант предмета (ME-стек или стек из PIM):
---   1) NBT-хеш "#<хеш>" - точный (нужен для exportItem, у баков с жидкостью он свой);
---   2) если хеша нет - тип жидкости;
---   3) иначе "" (обычный предмет).
 local function variantOf(it)
   local h = nbtOf(it)
   if h then return "#" .. h end
   return fluidVariant(it)
 end
-
--- raw=true: не трогать словарь переводов (для клиентов и лёгкого скана - экономия ОЗУ)
 local function labelOf(it, var, raw)
   local l = raw and tostring(it.label or it.name) or ruName(it.name, it.damage, tostring(it.label or it.name))
   if var and var ~= "" then
@@ -269,9 +183,6 @@ local function labelOf(it, var, raw)
   end
   return l
 end
-
--- совпадают ли варианты предметов: оба по хешу - строго; оба по жидкости - строго;
--- если у одного хеш, а у другого жидкость (PIM и ME описывают предмет по-разному) - считаем совпадением
 local function sameVariant(a, b)
   a, b = a or "", b or ""
   if a == b then return true end
@@ -280,15 +191,12 @@ local function sameVariant(a, b)
   if ha ~= hb then return true end
   return false
 end
-
--- обрезать/дополнить пробелами до ширины w (учитывает кириллицу)
 local function pad(s, w)
   s = tostring(s)
   local l = unicode.len(s)
   if l > w then return unicode.sub(s, 1, math.max(0, w)) end
   return s .. string.rep(" ", w - l)
 end
-
 local function wrap(s, width)
   local lines, cur = {}, ""
   for word in tostring(s):gmatch("%S+") do
@@ -306,30 +214,22 @@ local function wrap(s, width)
   if #lines == 0 then lines[1] = "" end
   return lines
 end
-
 local function dateStr(t)
   local ok, s = pcall(os.date, "%d.%m %H:%M", t)
   return ok and s or "?"
 end
-
-----------------------------------------------------------------------
--- БАЗА ДАННЫХ (один файл, сохраняется после каждого изменения)
-----------------------------------------------------------------------
 local db
-
 local function defaultDB()
   return { owners = {}, ownerUids = {}, kits = {}, nextKitId = 1, topup = {}, players = {}, feedback = {}, nextPurchaseId = 1, withdraw = false, cfgVer = 0, nextFbId = 1,
            nextJid = 1, intents = {}, nextIntentId = 1 }
 end
-
 local function loadDB()
-  -- основной файл, а если он пропал (сбой между remove и rename в saveDB) - временный
   for _, path in ipairs({ CONFIG.DB_PATH, CONFIG.DB_PATH .. ".tmp" }) do
     if fs.exists(path) then
       local f = io.open(path, "r")
       if f then
         local okR, data = pcall(f.read, f, "*a")
-        pcall(f.close, f)                              -- закрываем всегда, даже если чтение упало
+        pcall(f.close, f)
         local t
         if okR and data then
           local okU, res = pcall(ser.unserialize, data)
@@ -340,23 +240,19 @@ local function loadDB()
           for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
           return t
         end
-        -- файл повреждён: не затираем, а откладываем в сторону
         pcall(fs.copy, path, path .. ".bad")
       end
     end
   end
   return defaultDB()
 end
-
-local Net = {}        -- сетевой слой (заполняется ниже)
-
+local Net = {}
 local function saveDB()
-  if MODE == "terminal" then return Net.flush() end      -- у терминала своей базы нет: отправляем на сервер
+  if MODE == "terminal" then return Net.flush() end
   pcall(fs.makeDirectory, fs.path(CONFIG.DB_PATH))
   local tmp = CONFIG.DB_PATH .. ".tmp"
-  local function bad(msg) Net.saveOk = false; error(msg, 0) end     -- запоминаем, что сохранение не работает
-  memGuard()                           -- serialize строит всю базу строкой: освободим место заранее
-  -- строку строим ДО открытия файла: если serialize упадёт, ни одного дескриптора не потеряем
+  local function bad(msg) Net.saveOk = false; error(msg, 0) end
+  memGuard()
   local okS, data = pcall(ser.serialize, db)
   if not okS then
     gc(); memGuard()
@@ -365,7 +261,7 @@ local function saveDB()
   if not okS then bad("saveDB serialize: " .. tostring(data), 0) end
   local f, err = io.open(tmp, "w")
   if not f then
-    gc()                               -- висящие дескрипторы закрываются сборщиком мусора: пробуем ещё раз
+    gc()
     f, err = io.open(tmp, "w")
   end
   if not f then bad("saveDB open: " .. tostring(err), 0) end
@@ -373,20 +269,16 @@ local function saveDB()
     local r, e = f:write(data)
     if not r then error(e or "write failed", 0) end
   end)
-  local okC, cerr = pcall(f.close, f)  -- закрываем ВСЕГДА (и при ошибке записи)
+  local okC, cerr = pcall(f.close, f)
   data = nil
   if not okW then bad("saveDB write: " .. tostring(werr), 0) end
   if not okC then bad("saveDB close: " .. tostring(cerr), 0) end
-  -- старую базу удаляем только когда новая полностью записана; если rename упадёт,
-  -- loadDB подхватит .tmp
   pcall(fs.remove, CONFIG.DB_PATH)
   local okR, rerr = fs.rename(tmp, CONFIG.DB_PATH)
   if not okR then bad("saveDB rename: " .. tostring(rerr), 0) end
   Net.saveOk = true
-  pcall(Net.jFlush)                    -- база сохранена: дописываем журнал операций в его файл
+  pcall(Net.jFlush)
 end
-
--- сохранить с одной повторной попыткой после сборки мусора; возвращает true или false, текст ошибки
 function Net.trySave()
   local ok, err = pcall(saveDB)
   if ok then return true end
@@ -395,12 +287,11 @@ function Net.trySave()
   if ok then return true end
   return false, tostring(err)
 end
-
 local function getPlayer(name)
   local k = lower(name)
   local p = db.players[k]
   if not p and MODE == "terminal" then
-    pcall(Net.pullPlayer, name)             -- запись могла пропасть после отката - берём заново у сервера
+    pcall(Net.pullPlayer, name)
     p = db.players[k]
   end
   if not p then
@@ -412,9 +303,6 @@ local function getPlayer(name)
   p.purchases = p.purchases or {}
   return p
 end
-
--- Владелец определяется по нику И привязывается к UUID при первом входе:
--- если ник потом освободят и займёт другой человек, UUID не совпадёт.
 local function isOwner(name, uid)
   local match = false
   for _, o in ipairs(CONFIG.OWNERS) do
@@ -435,28 +323,22 @@ local function isOwner(name, uid)
   end
   return true
 end
-
 local function findKit(id)
   for i, k in ipairs(db.kits) do if k.id == id then return k, i end end
 end
-
 local function findPurchase(p, id)
   for i, pu in ipairs(p.purchases) do if pu.id == id then return pu, i end end
 end
-
 local function purchasePending(pu)
   local n = 0
   for _, it in ipairs(pu.items) do if it.qty > 0 then n = n + 1 end end
   return n
 end
-
 local function pendingCount(p)
   local n = 0
   for _, pu in ipairs(p.purchases) do n = n + purchasePending(pu) end
   return n
 end
-
--- убрать полностью выданные покупки
 local function purgePurchases(p)
   local changed = false
   for i = #p.purchases, 1, -1 do
@@ -464,8 +346,6 @@ local function purgePurchases(p)
   end
   if changed then saveDB() end
 end
-
--- сколько каждого предмета уже оплачено игроками, но ещё не выдано
 local function reservedMap(fresh)
   if MODE == "terminal" then
     if fresh or not Net.res or computer.uptime() - Net.resT > 3 then
@@ -489,33 +369,12 @@ local function reservedMap(fresh)
   end
   return r
 end
-
 local function unreadFeedback()
   if MODE == "terminal" and not Net.fbLoaded then return Net.unread or 0 end
   local n = 0
   for _, f in ipairs(db.feedback) do if not f.read then n = n + 1 end end
   return n
 end
-
-----------------------------------------------------------------------
--- ЖУРНАЛ ОПЕРАЦИЙ И ЖУРНАЛ НАМЕРЕНИЙ (ядро: работает с авторитетной db - одиночный ПК или сервер)
---
---   Журнал операций: покупки, пополнения, вывод, выдача, правки владельца (отдельный файл
---   CONFIG.JOURNAL_PATH, только дописывается; не лежит в базе и не занимает ОЗУ). Виден владельцу во вкладке «Создание» -> «Журнал».
---
---   Журнал намерений (db.intents) - защита пополнения от «зависших» предметов:
---     1) ПЕРЕД тем как забрать предметы, записывается намерение (ник, предмет, цена, сколько хотят внести);
---     2) предметы уходят в ME; сколько реально ушло, пишется в файл-«исходящие» (CONFIG.OUTBOX_PATH)
---        на ПК с PIM - он переживает и обрыв связи, и сбой сохранения базы;
---     3) зачисление (баланс + запись в журнал + удаление намерения) делается ОДНОЙ атомарной операцией
---        и идемпотентно: повтор того же зачисления ничего не удвоит;
---     4) если зачисление не прошло - оно повторяется при следующем входе игрока или запуске программы.
---   Намерение, у которого неизвестно, сколько предметов ушло (питание пропало ровно между шагами 1 и 2),
---   помечается «unknown» и показывается владельцу на проверку.
-----------------------------------------------------------------------
--- Запись попадает в очередь Net.jPending и пишется в файл ПОСЛЕ успешного сохранения базы (см. конец saveDB):
--- так откат операции (jUndo) просто убирает запись из очереди, а в журнале не бывает записей об операциях,
--- которых в базе нет. Если запись в файл не удалась, она остаётся в очереди и уйдёт со следующим сохранением.
 Net.jPending = {}
 function Net.jAdd(e)
   db.nextJid = db.nextJid or 1
@@ -529,16 +388,12 @@ function Net.jAdd(e)
   while #pq > 500 do table.remove(pq, 1) end
   return ent
 end
-
--- откат записи журнала, если операцию не удалось сохранить
 function Net.jUndo(ent)
   local pq = Net.jPending
   for i = #pq, 1, -1 do
     if pq[i] == ent then table.remove(pq, i); break end
   end
 end
-
--- дописать накопленные записи в файл журнала; true - всё записано
 function Net.jFlush()
   local pq = Net.jPending
   if #pq == 0 then return true end
@@ -557,8 +412,6 @@ function Net.jFlush()
   if okW then Net.jPending = {} end
   return okW
 end
-
--- последние CONFIG.JOURNAL_KEEP записей (с фильтром по нику) из файла + ещё не записанные; файл читается построчно
 function Net.jList(filter)
   filter = lower(filter or "")
   local keep = CONFIG.JOURNAL_KEEP or 300
@@ -590,8 +443,6 @@ function Net.jList(filter)
   while #out > keep do table.remove(out, 1) end
   return out, db.intents or {}
 end
-
--- Незабранные позиции игрока (для владельца): покупки и комплекты, оплаченные, но не выданные
 function Net.pendGet(who, name)
   if not isOwner(tostring(who)) then return { err = "forbidden" } end
   local p = db.players[lower(tostring(name))]
@@ -608,9 +459,6 @@ function Net.pendGet(who, name)
   end
   return { ok = true, name = p.name, bal = round2(tonumber(p.balance) or 0), list = list }
 end
-
--- Изменить остаток незабранной позиции (только уменьшить; 0 - убрать позицию). Причина обязательна, запись
--- идёт в журнал. Деньги не возвращаются сами: при необходимости начислите их вкладкой «Балансы» (+ / -).
 function Net.pendEdit(who, name, pid, idx, qty, reason)
   if not isOwner(tostring(who)) then return { err = "forbidden" } end
   reason = trim(tostring(reason or "")):gsub("%s+", " ")
@@ -620,7 +468,7 @@ function Net.pendEdit(who, name, pid, idx, qty, reason)
   if not p then return { err = "noplayer" } end
   local pu, pidx = findPurchase(p, tonumber(pid))
   local it = pu and pu.items[tonumber(idx) or 0]
-  if not it or (tonumber(it.qty) or 0) <= 0 then return { err = "gone" } end     -- уже забрали или изменили
+  if not it or (tonumber(it.qty) or 0) <= 0 then return { err = "gone" } end
   qty = math.floor(tonumber(qty) or -1)
   local old = it.qty
   if qty < 0 or qty > old then return { err = "badqty" } end
@@ -642,7 +490,6 @@ function Net.pendEdit(who, name, pid, idx, qty, reason)
   end
   return { ok = true, old = old, qty = qty }
 end
-
 function Net.pList(filter)
   local out = {}
   filter = lower(filter or "")
@@ -655,12 +502,10 @@ function Net.pList(filter)
   while #out > 300 do out[#out] = nil end
   return out
 end
-
--- правка баланса владельцем. mode: "set" - установить, "add" - прибавить (можно отрицательное)
 function Net.adjustBalance(who, name, mode, value, reason)
   if not isOwner(tostring(who)) then return { err = "forbidden" } end
   reason = trim(tostring(reason or "")):gsub("%s+", " ")
-  if unicode.len(reason) < 3 then return { err = "noreason" } end      -- причина обязательна
+  if unicode.len(reason) < 3 then return { err = "noreason" } end
   reason = unicode.sub(reason, 1, 80)
   local p = db.players[lower(tostring(name))]
   if not p then return { err = "noplayer" } end
@@ -682,12 +527,9 @@ function Net.adjustBalance(who, name, mode, value, reason)
   end
   return { ok = true, old = old, bal = new }
 end
-
 function Net.findIntent(id)
   for i, it in ipairs(db.intents or {}) do if it.id == id then return it, i end end
 end
-
--- 1) записать намерение (ДО того как предметы ушли в ME). Возвращает id или nil, ошибка
 function Net.iNew(a)
   db.intents = db.intents or {}
   db.nextIntentId = db.nextIntentId or 1
@@ -704,9 +546,6 @@ function Net.iNew(a)
   end
   return it.id
 end
-
--- 3) зачесть пополнение: moved предметов реально ушло в ME (moved <= 0 - отмена намерения).
--- Идемпотентно: если намерения уже нет (зачтено раньше), просто отвечает ok.
 function Net.iFinish(id, moved)
   local it, idx = Net.findIntent(id)
   if not it then return { ok = true, done = true } end
@@ -735,9 +574,6 @@ function Net.iFinish(id, moved)
   end
   return { ok = true, gain = gain, bal = p.balance, moved = moved, label = it.label, player = p.name }
 end
-
--- намерения, у которых неизвестно, сколько ушло в ME, переводим в «unknown» (name - только этого игрока).
--- Если потом придёт iFinish с точным числом, оно всё равно будет зачтено.
 function Net.iSweep(name)
   local changed = 0
   for _, it in ipairs(db.intents or {}) do
@@ -748,8 +584,6 @@ function Net.iSweep(name)
   if changed > 0 then pcall(Net.trySave) end
   return changed
 end
-
--- владелец закрывает намерение «unknown» после ручной проверки
 function Net.iDrop(who, id)
   if not isOwner(tostring(who)) then return { err = "forbidden" } end
   local it, idx = Net.findIntent(id)
@@ -764,16 +598,10 @@ function Net.iDrop(who, id)
   end
   return { ok = true }
 end
-
-----------------------------------------------------------------------
--- СЕТЬ: сервер хранит базу, терминалы спрашивают его по модему
-----------------------------------------------------------------------
 do
 local NET_TAG = "KS1"
 local termId = computer.address():sub(1, 8)
 local ridCounter = 0
-
--- режет строку на куски, не разрывая многобайтные символы UTF-8
 local function netSplit(payload)
   local parts, pos, len, size = {}, 1, #payload, CONFIG.NET_CHUNK
   if len == 0 then return { "" } end
@@ -788,7 +616,6 @@ local function netSplit(payload)
   end
   return parts
 end
-
 local function netSend(addr, port, rid, payload)
   local parts = netSplit(payload)
   for i, part in ipairs(parts) do
@@ -796,11 +623,9 @@ local function netSend(addr, port, rid, payload)
     else modem.broadcast(port, NET_TAG, CONFIG.NET_KEY, rid, i, #parts, part) end
   end
 end
-
--- складывает пришедшие куски; когда все на месте - возвращает целую строку
 local function netCollect(box, ekey, idx, total, part)
   local now = computer.uptime()
-  for k, b in pairs(box) do if now - b.t > 60 then box[k] = nil end end    -- недособранное выбрасываем
+  for k, b in pairs(box) do if now - b.t > 60 then box[k] = nil end end
   if type(idx) ~= "number" or type(total) ~= "number" or type(part) ~= "string" then return nil end
   local b = box[ekey]
   if not b then b = { n = 0, total = total, parts = {}, t = now }; box[ekey] = b end
@@ -811,33 +636,23 @@ local function netCollect(box, ekey, idx, total, part)
     return table.concat(b.parts, "", 1, b.total)
   end
 end
-
----------- сервер: обработчики команд (работают с авторитетной базой db) ----------
 local SRV = {}
-
 local function cfgOf()
   return { kits = db.kits, nextKitId = db.nextKitId, topup = db.topup, withdraw = db.withdraw }
 end
-
--- hello = проверка здоровья: сервер жив и умеет сохранять. Если последнее сохранение упало,
--- пробуем сохранить ещё раз (вдруг память/дескрипторы освободились) и честно сообщаем результат.
 SRV.hello = function()
   if Net.saveOk == false then Net.trySave() end
   return { ok = true, saving = Net.saveOk ~= false }
 end
-
 SRV.login = function(a)
   local name = tostring(a.name)
   local owner = isOwner(name, a.uid)
   local p = getPlayer(name)
-  Net.iSweep(name)           -- намерения прошлого визита с неизвестным результатом -> на проверку владельцу
+  Net.iSweep(name)
   return { ok = true, owner = owner, player = p, cfg = cfgOf(), ver = db.cfgVer or 0, unread = unreadFeedback() }
 end
-
 SRV.player = function(a) return { ok = true, player = getPlayer(tostring(a.name)) } end
-
 SRV.config = function() return { ok = true, cfg = cfgOf(), ver = db.cfgVer or 0 } end
-
 SRV.pushConfig = function(a)
   if not isOwner(tostring(a.who)) then return { err = "forbidden" } end
   if (db.cfgVer or 0) ~= a.base then return { err = "stale" } end
@@ -849,15 +664,12 @@ SRV.pushConfig = function(a)
   db.cfgVer = (db.cfgVer or 0) + 1
   local okSave, serr = Net.trySave()
   if not okSave then
-    -- не сохранилось: возвращаем прежние настройки, чтобы память не разошлась с диском
     db.kits, db.topup, db.nextKitId, db.withdraw, db.cfgVer = oKits, oTopup, oNext, oWd, oVer
     print("pushConfig: не удалось сохранить базу: " .. serr)
     return { err = "save" }
   end
   return { ok = true, ver = db.cfgVer }
 end
-
--- запись игрока: принимается только если версия (rev) совпала; chk - проверка остатков при покупке
 SRV.pushPlayer = function(a)
   local sp = getPlayer(tostring(a.name))
   if (sp.rev or 0) ~= (a.base or 0) then return { err = "rev" } end
@@ -873,7 +685,7 @@ SRV.pushPlayer = function(a)
     end
   end
   sp.rev = (sp.rev or 0) + 1
-  local added = {}                      -- записи журнала, пришедшие вместе с операцией (одно сохранение на всё)
+  local added = {}
   for _, le in ipairs(type(a.log) == "table" and a.log or {}) do
     if type(le) == "table" then
       added[#added + 1] = Net.jAdd({ kind = le.kind, player = sp.name, text = le.text, delta = le.delta, bal = sp.balance })
@@ -881,8 +693,6 @@ SRV.pushPlayer = function(a)
   end
   local okSave, serr = Net.trySave()
   if not okSave then
-    -- на диск не записалось: откатываем память и честно отвечаем ошибкой. Терминал в этом случае
-    -- ничего не выдаст (покупка) или не заберёт предметы (пополнение), а баланс останется прежним
     for i = #added, 1, -1 do Net.jUndo(added[i]) end
     sp.balance, sp.purchases, sp.rev = oldBal, oldPur, oldRev
     print("pushPlayer " .. tostring(a.name) .. ": не удалось сохранить базу: " .. serr)
@@ -890,9 +700,7 @@ SRV.pushPlayer = function(a)
   end
   return { ok = true, rev = sp.rev }
 end
-
 SRV.reserved = function() return { ok = true, map = reservedMap() } end
-
 SRV.wanted = function()
   local w = {}
   for _, p in pairs(db.players) do
@@ -902,7 +710,6 @@ SRV.wanted = function()
   end
   return { ok = true, names = w }
 end
-
 SRV.allocId = function()
   local id = db.nextPurchaseId
   db.nextPurchaseId = id + 1
@@ -914,14 +721,12 @@ SRV.allocId = function()
   end
   return { ok = true, id = id }
 end
-
 local function fbIds()
   db.nextFbId = db.nextFbId or 1
   for _, f in ipairs(db.feedback) do
     if not f.id then f.id = db.nextFbId; db.nextFbId = db.nextFbId + 1 end
   end
 end
-
 SRV.fbAdd = function(a)
   fbIds()
   local snap, oldNext = {}, db.nextFbId
@@ -938,12 +743,10 @@ SRV.fbAdd = function(a)
   end
   return { ok = true }
 end
-
 SRV.fbList = function()
   fbIds()
   return { ok = true, list = db.feedback, unread = unreadFeedback() }
 end
-
 SRV.fbOp = function(a)
   fbIds()
   local snap, flags = {}, {}
@@ -962,24 +765,18 @@ SRV.fbOp = function(a)
   end
   return { ok = true }
 end
-
--- журнал операций, список игроков и правка баланса (только для владельца)
 SRV.journal = function(a)
   if not isOwner(tostring(a.who)) then return { err = "forbidden" } end
   local list, intents = Net.jList(a.filter)
   return { ok = true, list = list, intents = intents }
 end
-
 SRV.players = function(a)
   if not isOwner(tostring(a.who)) then return { err = "forbidden" } end
   return { ok = true, list = Net.pList(a.filter) }
 end
-
 SRV.adjust = function(a) return Net.adjustBalance(a.who, a.name, a.mode, a.value, a.reason) end
 SRV.pend = function(a) return Net.pendGet(a.who, a.name) end
 SRV.pendEdit = function(a) return Net.pendEdit(a.who, a.name, a.pid, a.idx, a.qty, a.reason) end
-
--- журнал намерений пополнения
 SRV.intentNew = function(a)
   local id, err = Net.iNew(a)
   if not id then print("intentNew: не удалось сохранить базу: " .. tostring(err)); return { err = "save" } end
@@ -987,7 +784,6 @@ SRV.intentNew = function(a)
 end
 SRV.intentDone = function(a) return Net.iFinish(a.id, a.moved) end
 SRV.intentDrop = function(a) return Net.iDrop(a.who, a.id) end
-
 SRV.owner = function(a)
   local cmd, nick, lines = a.cmd, a.nick, {}
   local oOwners, oUids = {}, {}
@@ -1025,8 +821,6 @@ SRV.owner = function(a)
   end
   return { ok = true, lines = lines }
 end
-
--- команды владельцев, поставленные в очередь на самом сервере (lua shop.lua owner add Ник)
 function Net.applyQueue()
   local f = io.open(CONFIG.CMD_PATH, "r")
   if not f then return end
@@ -1042,12 +836,9 @@ function Net.applyQueue()
     end
   end
 end
-
--- команды, ответ на которые кэшируется: повтор запроса (потерялся ответ) не должен выполнить его дважды
 local IDEMPOTENT = { pushPlayer = true, allocId = true, fbAdd = true, fbOp = true, pushConfig = true, owner = true,
                      adjust = true, pendEdit = true, intentNew = true, intentDone = true, intentDrop = true }
 local srvBox, replyCache, replyOrder = {}, {}, {}
-
 local seenTerm, lastBadKey = {}, -100
 function Net.serverHandle(e)
   if e[4] ~= CONFIG.NET_PORT or e[6] ~= NET_TAG then return end
@@ -1071,24 +862,20 @@ function Net.serverHandle(e)
     if ok then reply = r
     else
       reply = { err = "server: " .. tostring(r):sub(1, 300) }; print(tostring(r))
-      pcall(function() Net.reportError(r) end)          -- в error.log и в «Отзывы»
+      pcall(function() Net.reportError(r) end)
     end
   else
     reply = { err = "unknown command" }
   end
   local out = ser.serialize(reply)
-  if req and IDEMPOTENT[req.cmd] and type(reply) == "table" and reply.ok then   -- ошибки не кэшируем: повтор должен выполниться заново
+  if req and IDEMPOTENT[req.cmd] and type(reply) == "table" and reply.ok then
     replyCache[rid] = out
     replyOrder[#replyOrder + 1] = rid
     if #replyOrder > 100 then replyCache[table.remove(replyOrder, 1)] = nil end
   end
   netSend(remote, CONFIG.NET_PORT + 1, rid, out)
 end
-
----------- терминал: запросы к серверу ----------
 local netBox = {}
-
--- один запрос; возвращает таблицу-ответ или nil, "NETFAIL"
 function Net.call(cmd, a, tries)
   ridCounter = ridCounter + 1
   local rid = termId .. "-" .. math.floor(os.time()) .. "-" .. ridCounter
@@ -1110,49 +897,40 @@ function Net.call(cmd, a, tries)
           if type(r) == "table" then return r end
           return nil, "NETFAIL"
         end
-        deadline = computer.uptime() + CONFIG.NET_TIMEOUT      -- куски идут: ждём остальные
+        deadline = computer.uptime() + CONFIG.NET_TIMEOUT
       end
     end
   end
   return nil, "NETFAIL"
 end
-
--- запрос: при обрыве связи бросает понятное игроку сообщение; ответ-отказ (r.err) возвращает как есть
 function Net.try(cmd, a, tries)
   local r = Net.call(cmd, a, tries)
   if not r then error("USERMSG:Нет связи с сервером. Попробуйте позже.", 0) end
   return r
 end
-
--- то же, но любой отказ сервера тоже считается ошибкой
 function Net.req(cmd, a, tries)
   local r = Net.try(cmd, a, tries)
   if r.err == "save" then error("USERMSG:Сервер не смог сохранить данные. Повторите позже.", 0) end
   if r.err then error("USERMSG:Ошибка сервера: " .. tostring(r.err):sub(1, 120), 0) end
   return r
 end
-
 local function applyCfg(c, ver)
   db.kits, db.topup = c.kits or {}, c.topup or {}
   db.nextKitId = c.nextKitId or 1
   db.withdraw = c.withdraw or false
   Net.cfgVer = ver or 0
-  Net.cfgSnap = Net.owner and ser.serialize(cfgOf()) or nil     -- снимок нужен только владельцу (чтобы заметить правки)
+  Net.cfgSnap = Net.owner and ser.serialize(cfgOf()) or nil
 end
-
 function Net.pullConfig()
   local r = Net.req("config", {})
   applyCfg(r.cfg, r.ver)
 end
-
 function Net.pullPlayer(name)
   local r = Net.req("player", { name = name })
   r.player.name = name
   r.player.purchases = r.player.purchases or {}
   db.players[lower(name)] = r.player
 end
-
--- вход игрока: данные игрока + настройки магазина одним запросом
 function Net.login(name, uid)
   local r = Net.call("login", { name = name, uid = uid and tostring(uid) })
   if not r or not r.ok then return nil, "NETFAIL" end
@@ -1166,16 +944,13 @@ function Net.login(name, uid)
   applyCfg(r.cfg, r.ver)
   return r
 end
-
 function Net.logout()
   db.players, db.feedback = {}, {}
   Net.who, Net.owner, Net.cfgSnap, Net.fbLoaded = nil, false, nil, false
   Net.res, Net.jq, Net.jc, Net.pc = nil, {}, nil, nil
 end
-
--- отправка записи игрока; false, причина - если сервер не принял
 local function pushPlayerRec(p, chk, tries)
-  local lg = (Net.jq and #Net.jq > 0) and Net.jq or nil      -- записи журнала едут вместе с операцией
+  local lg = (Net.jq and #Net.jq > 0) and Net.jq or nil
   local r = Net.try("pushPlayer", { name = p.name, base = p.rev or 0,
                                     rec = { balance = p.balance, purchases = p.purchases }, chk = chk, log = lg }, tries)
   Net.res = nil
@@ -1186,14 +961,10 @@ local function pushPlayerRec(p, chk, tries)
   end
   return false, r.err
 end
-
--- откат: взять запись игрока у сервера заново (если не получилось - убрать локальную, она подтянется позже)
 local function rollbackPlayer(name)
-  Net.jq = {}                               -- операция отменена: её записи в журнал не нужны
+  Net.jq = {}
   if not pcall(Net.pullPlayer, name) then db.players[lower(name)] = nil end
 end
-
--- saveDB() терминала: отправить правки (настройки - только от владельца, запись игрока - всегда)
 function Net.flush()
   if Net.owner and Net.who then
     local snap = ser.serialize(cfgOf())
@@ -1223,10 +994,7 @@ function Net.flush()
     end
   end
 end
-
--- проверка перед покупкой / пополнением / выводом: сервер отвечает и может сохранять данные.
--- true или false, текст для игрока. Вызывать ДО списания и до приёма предметов.
-function Net.preflight(notify)       -- notify(текст) - показать статус (передаёт вызывающий)
+function Net.preflight(notify)
   if MODE ~= "terminal" then
     if Net.saveOk == false and not Net.trySave() then
       return false, "Магазин временно не может сохранять данные. Ничего не списано, повторите позже."
@@ -1242,8 +1010,6 @@ function Net.preflight(notify)       -- notify(текст) - показать с
   end
   return true
 end
-
--- покупка: записать игрока с проверкой остатков на сервере. true или false, текст для игрока
 function Net.commitPlayer(p, chk)
   local name = p.name
   local okc, ok, why = pcall(pushPlayerRec, p, chk, 5)
@@ -1254,15 +1020,12 @@ function Net.commitPlayer(p, chk)
   if why == "save" then return false, "Сервер не смог сохранить данные. Операция отменена, повторите позже." end
   return false, "Данные игрока обновились на другом терминале. Повторите действие."
 end
-
 function Net.newPurchaseId()
   if MODE == "terminal" then return Net.req("allocId", {}).id end
   local id = db.nextPurchaseId
   db.nextPurchaseId = id + 1
   return id
 end
-
--- отзывы владельца
 local fbStamp
 function Net.fbEnsure(force)
   if MODE ~= "terminal" then return end
@@ -1292,10 +1055,6 @@ function Net.fbAddEntry(player, text)
   while #db.feedback > CONFIG.FEEDBACK_KEEP do table.remove(db.feedback, 1) end
   saveDB()
 end
-
----------- журнал операций (запись со стороны терминала / одиночного ПК) ----------
--- Одиночный ПК: запись сразу в db (сохранится тем же saveDB, что и сама операция).
--- Терминал: запись ждёт в очереди и уезжает на сервер вместе с записью игрока (одно атомарное сохранение).
 function Net.log(kind, player, text, delta, bal)
   local e = { kind = kind, player = player, text = text, delta = delta, bal = bal }
   if MODE == "terminal" then
@@ -1305,8 +1064,6 @@ function Net.log(kind, player, text, delta, bal)
     Net.jAdd(e)
   end
 end
-
--- журнал для экрана владельца: список записей и незавершённые намерения
 function Net.jView(filter, force)
   filter = lower(filter or "")
   if MODE ~= "terminal" then return Net.jList(filter) end
@@ -1318,8 +1075,6 @@ function Net.jView(filter, force)
   end
   return c.list, c.intents
 end
-
--- игроки для экрана «Балансы»
 function Net.pView(filter, force)
   filter = lower(filter or "")
   if MODE ~= "terminal" then return Net.pList(filter) end
@@ -1331,12 +1086,10 @@ function Net.pView(filter, force)
   end
   return c.list
 end
-
 function Net.doAdjust(who, name, mode, value, reason)
   local r
   if MODE == "terminal" then
     r = Net.try("adjust", { who = who, name = name, mode = mode, value = value, reason = reason }, 4)
-    -- версия записи игрока на сервере выросла: если это игрок на этом терминале, берём запись заново
     if r.ok and db.players[lower(name)] then pcall(Net.pullPlayer, name) end
   else
     r = Net.adjustBalance(who, name, mode, value, reason)
@@ -1344,25 +1097,21 @@ function Net.doAdjust(who, name, mode, value, reason)
   Net.jc, Net.pc = nil, nil
   return r
 end
-
--- незабранные позиции игрока для экрана владельца (без кэша: экран сам решает, когда перечитать)
 function Net.pendView(who, name)
   if MODE == "terminal" then return Net.req("pend", { who = who, name = name }) end
   return Net.pendGet(who, name)
 end
-
 function Net.doPendEdit(who, name, pid, idx, qty, reason)
   local r
   if MODE == "terminal" then
     r = Net.try("pendEdit", { who = who, name = name, pid = pid, idx = idx, qty = qty, reason = reason }, 4)
-    if r.ok and db.players[lower(name)] then pcall(Net.pullPlayer, name) end   -- игрок на этом терминале: свежая запись
+    if r.ok and db.players[lower(name)] then pcall(Net.pullPlayer, name) end
   else
     r = Net.pendEdit(who, name, pid, idx, qty, reason)
   end
   Net.jc, Net.pc = nil, nil
   return r
 end
-
 function Net.doDrop(who, id)
   local r
   if MODE == "terminal" then r = Net.try("intentDrop", { who = who, id = id }, 4)
@@ -1370,9 +1119,6 @@ function Net.doDrop(who, id)
   Net.jc = nil
   return r
 end
-
----------- журнал намерений пополнения (сторона ПК с PIM) ----------
--- 1) записать намерение ДО того как предметы уйдут. Возвращает id или nil
 function Net.depositBegin(a)
   if MODE == "terminal" then
     local r = Net.call("intentNew", a, 3)
@@ -1381,8 +1127,6 @@ function Net.depositBegin(a)
   end
   return (Net.iNew(a))
 end
-
--- файл «исходящих»: сколько предметов уже ушло в ME, но зачисление ещё не подтверждено
 function Net.outboxLoad()
   local f = io.open(CONFIG.OUTBOX_PATH, "r")
   if not f then return {} end
@@ -1394,7 +1138,6 @@ function Net.outboxLoad()
   end
   return {}
 end
-
 function Net.outboxSave(t)
   if #t == 0 then pcall(fs.remove, CONFIG.OUTBOX_PATH); return true end
   pcall(fs.makeDirectory, fs.path(CONFIG.OUTBOX_PATH))
@@ -1404,20 +1147,16 @@ function Net.outboxSave(t)
   pcall(f.close, f)
   return okW
 end
-
 function Net.outboxAdd(en)
   local t = Net.outboxLoad()
   t[#t + 1] = en
   return Net.outboxSave(t)
 end
-
 function Net.outboxDel(id)
   local t, out = Net.outboxLoad(), {}
   for _, en in ipairs(t) do if en.id ~= id then out[#out + 1] = en end end
   Net.outboxSave(out)
 end
-
--- 3) зачисление на авторитетной базе; ответ-таблица при успехе, nil - не прошло (повторим позже)
 function Net.depositFinish(id, moved)
   if MODE == "terminal" then
     local r = Net.call("intentDone", { id = id, moved = moved }, 4)
@@ -1428,24 +1167,18 @@ function Net.depositFinish(id, moved)
   if ok and type(r) == "table" and r.ok then return r end
   return nil
 end
-
--- зачисление после того, как предметы ушли в ME. Возвращает ответ с gain/bal или nil
 function Net.depositEnd(id, moved, player)
-  if moved <= 0 then                      -- ничего не ушло: просто отменяем намерение
+  if moved <= 0 then
     pcall(Net.depositFinish, id, 0)
     return { ok = true, gain = 0 }
   end
-  Net.outboxAdd({ id = id, moved = moved, player = player })      -- запомнили на диске ДО обращения к базе
+  Net.outboxAdd({ id = id, moved = moved, player = player })
   local r = Net.depositFinish(id, moved)
   if not r then return nil end
   Net.outboxDel(id)
-  -- запись игрока на терминале устарела (сервер поднял версию): берём заново
   if MODE == "terminal" and player and db.players[lower(player)] then pcall(Net.pullPlayer, player) end
   return r
 end
-
--- повтор незавершённых зачислений (при запуске программы и при входе игрока).
--- Возвращает сколько зачислено и сколько монет получил игрок who (если указан)
 function Net.outboxRetry(who)
   local t = Net.outboxLoad()
   if #t == 0 then return 0, 0 end
@@ -1462,18 +1195,7 @@ function Net.outboxRetry(who)
   return n, round2(mine)
 end
 end
-
-----------------------------------------------------------------------
--- ME: кэш остатков (сканируется при входе игрока и по кнопке "Обновить")
-----------------------------------------------------------------------
--- cache.byKey  - остатки только нужных магазину предметов
--- cache.items  - список для выбора предметов (ТОЛЬКО у владельца, только в окне выбора,
---                максимум CONFIG.PICK_MAX штук, фильтруется поиском)
 local cache = { items = {}, byKey = {}, time = nil, pickMore = false, pickTotal = 0 }
-
--- какие предметы нужны магазину: комплекты, ресурсы пополнения, неотданные покупки
--- Владелец (full=true): комплекты, пополнение и покупки ВСЕХ игроков (нужно для миграции и учёта резерва).
--- Клиент: комплекты, пополнение и только его собственные покупки - меньше предметов, меньше ОЗУ.
 local function wantedNames(who, full)
   local w = {}
   for _, k in ipairs(db.kits) do for _, it in ipairs(k.items) do w[it.name] = true end end
@@ -1493,8 +1215,6 @@ local function wantedNames(who, full)
   end
   return w
 end
-
--- Миграция старых записей: var был названием жидкости ("chocolatemilk"), теперь это NBT-хеш "#...".
 local function migrateVariants(by)
   local changed = false
   local function fix(x)
@@ -1515,27 +1235,17 @@ local function migrateVariants(by)
   end
   if changed then saveDB() end
 end
-
--- Список предметов ME с NBT-хешем.
--- Обычные предметы берём из getItemsInNetwork (там есть название), а предметы с NBT (hasTag),
--- например баки с жидкостью, - из getAvailableItems: там у fingerprint есть nbt_hash.
--- Жидкость и название NBT-предмета читаем из getItemDetail (кэш по хешу).
--- fname/fdmg - необязательный фильтр по одному предмету.
--- Кэш деталей NBT-предметов ограничен по размеру и хранит только нужные поля (экономия ОЗУ).
 local detailCache, detailCount, DETAIL_MAX = {}, 0, 200
-memReleasers[#memReleasers + 1] = function() detailCache, detailCount = {}, 0 end   -- 2) детали NBT-предметов
+memReleasers[#memReleasers + 1] = function() detailCache, detailCount = {}, 0 end
 local function shallow(t)
   if type(t) ~= "table" then return nil end
   local r = {}
   for k, v in pairs(t) do if type(v) ~= "table" then r[k] = v end end
   return r
 end
--- Из полного списка getAvailableItems берём ТОЛЬКО NBT-предметы (маленькая таблица),
--- а сам огромный список сразу отпускаем: он не должен жить одновременно с getItemsInNetwork.
--- match(f) - фильтр по fingerprint (f.id, f.dmg).
 local function taggedFromRaw(match)
-  gc()                                 -- освободить память ДО тяжёлого запроса
-  memGuard()                           -- и выгрузить кэши, если ОЗУ на исходе
+  gc()
+  memGuard()
   local ok, raw = pcall(me.getAvailableItems)
   if not ok or type(raw) ~= "table" then return nil end
   local t = {}
@@ -1548,12 +1258,9 @@ local function taggedFromRaw(match)
     end
   end
   raw = nil
-  gc()                                 -- огромный список больше не нужен
+  gc()
   return t
 end
-
--- Склеивает обычные предметы из base (без hasTag) и NBT-предметы из tagged (с деталями из кэша).
--- Нет NBT-предметов - возвращает base как есть.
 local function mergeTagged(base, tagged)
   if not tagged or #tagged == 0 then return base end
   local out = {}
@@ -1592,7 +1299,6 @@ local function mergeTagged(base, tagged)
   end
   return out
 end
-
 local function meList(fname, fdmg)
   local function fmatch(f)
     return not fname or (f.id == fname and (fdmg == nil or math.floor(tonumber(f.dmg) or 0) == fdmg))
@@ -1603,7 +1309,6 @@ local function meList(fname, fdmg)
     if not ok then return tostring(base) end
     if type(base) ~= "table" then return base end
     if me.getAvailableItems == nil then return base end
-    -- тяжёлый getAvailableItems нужен только если среди предметов есть NBT
     local anyTag = false
     for _, it in ipairs(base) do
       if type(it) == "table" and it.hasTag then anyTag = true; break end
@@ -1611,7 +1316,6 @@ local function meList(fname, fdmg)
     if not anyTag then return base end
     tagged = taggedFromRaw(fmatch)
   else
-    -- полный список: сначала NBT-предметы (большой raw тут же освобождается), потом обычные
     if me.getAvailableItems ~= nil then tagged = taggedFromRaw(fmatch); gc() end
     ok, base = pcall(me.getItemsInNetwork)
     if not ok then return tostring(base) end
@@ -1619,20 +1323,13 @@ local function meList(fname, fdmg)
   end
   return mergeTagged(base, tagged)
 end
-
--- Лёгкий скан при входе: запоминаем остатки только нужных предметов.
--- who - ник игрока, full - владелец ли он (см. wantedNames).
--- Если нужных id немного, спрашиваем ME по каждому отдельно (маленькие ответы) вместо полного
--- списка сети. Полный список с NBT (getAvailableItems) берём только если среди ответов есть NBT-предметы.
--- Словарь переводов здесь не нужен: названия уже лежат в записях комплектов и покупок.
 local function scanME(who, full)
   return pcall(function()
     local want, names = wantedNames(who, full), {}
     for n in pairs(want) do names[#names + 1] = n end
-
     local list, anyTag = {}, false
     if #names > 0 then
-      if #names <= 200 then          -- по одному id (маленькие ответы); полный список сети - только в крайнем случае
+      if #names <= 200 then
         for _, n in ipairs(names) do
           local ok, part = pcall(me.getItemsInNetwork, { name = n })
           if not ok then error("ME вернула " .. tostring(part)) end
@@ -1646,7 +1343,6 @@ local function scanME(who, full)
           end
         end
         if anyTag and me.getAvailableItems ~= nil then
-          -- есть NBT-предметы: один раз берём их хеши (только нужные id), полный список сети не держим
           list = mergeTagged(list, taggedFromRaw(function(f) return want[f.id] end))
         end
       else
@@ -1654,7 +1350,6 @@ local function scanME(who, full)
         if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
       end
     end
-
     local by = {}
     for _, it in ipairs(list) do
       local name = type(it) == "table" and it.name
@@ -1677,58 +1372,41 @@ local function scanME(who, full)
     gc()
   end)
 end
-
--- нормализация для поиска: нижний регистр, разделители -> пробелы
 local function searchNorm(s)
   return (lower(s):gsub("[_:%-%.]", " "))
 end
-
--- Список для выбора предметов (владелец): ВСЕ предметы ME, отсортированные по алфавиту.
--- Поиск: каждое слово запроса должно встречаться в названии или id предмета.
 local function pickerScan(filter)
   cache.items = {}
-  gc()                                 -- результаты прошлого поиска и мусор от них - долой до нового запроса
+  gc()
   return pcall(function()
     local list = meList()
     if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
-
     local words = {}
     for w in searchNorm(filter or ""):gmatch("%S+") do words[#words + 1] = w end
-
-    -- Сортируем исходный список прямо на месте (без копий): предметы одного мода идут подряд,
-    -- поэтому файл словаря мода читается один раз, а не дёргается по кругу.
     table.sort(list, function(a, b)
       local an = type(a) == "table" and tostring(a.name) or ""
       local bn = type(b) == "table" and tostring(b.name) or ""
       if an ~= bn then return an < bn end
       return (type(a) == "table" and tonumber(a.damage) or 0) < (type(b) == "table" and tonumber(b.damage) or 0)
     end)
-
     local function cmp(a, b)
       if a[3] ~= b[3] then return a[3] < b[3] end
       if a[1] ~= b[1] then return a[1] < b[1] end
       return a[2] < b[2]
     end
-
-    -- В памяти держим не все предметы ME, а только PICK_MAX первых по алфавиту:
-    -- копим буфер и, когда он вырос вдвое, сортируем и обрезаем.
-    -- Без поискового запроса список уже отсортирован по id, поэтому первые K записей известны сразу:
-    -- название (а с ним словарь перевода) считаем только для них, а не для всех предметов сети.
-    -- С запросом название нужно каждому предмету (по нему идёт поиск).
     local K = CONFIG.PICK_MAX
     local buf, total = {}, 0
     local pName, pDmg, pVar, prevEntry
     local searching = #words > 0
     for i = 1, #list do
       local it = list[i]
-      list[i] = false                  -- отпускаем ссылку сразу, как обработали
+      list[i] = false
       if i % 64 == 0 then memGuard() end
       local name = type(it) == "table" and it.name
       if name then
         local dmg = math.floor(tonumber(it.damage) or 0)
         local var = variantOf(it)
         if name == pName and dmg == pDmg and var == pVar then
-          -- тот же предмет подряд (несколько стеков): складываем количество
           if prevEntry then prevEntry[4] = prevEntry[4] + (tonumber(it.size) or 0) end
         elseif not searching then
           pName, pDmg, pVar = name, dmg, var
@@ -1767,7 +1445,6 @@ local function pickerScan(filter)
     gc()
   end)
 end
--- точный запрос по одному предмету (дёшево, используется при покупке/выдаче)
 local function meCount(name, damage, var)
   local list = meList(name, damage)
   if type(list) ~= "table" then return nil end
@@ -1780,9 +1457,6 @@ local function meCount(name, damage, var)
   end
   return total
 end
-
--- Подбирает вариант предмета из ME под вариант из инвентаря (PIM и ME могут описывать
--- один и тот же предмет по-разному: жидкость / хеш). Возвращает вариант ME и остаток, либо nil.
 local function meResolve(name, damage, var)
   var = var or ""
   local list = meList(name, damage)
@@ -1802,7 +1476,6 @@ local function meResolve(name, damage, var)
   end
   return nil
 end
-
 local function availFn()
   local res = reservedMap()
   return function(key)
@@ -1810,7 +1483,6 @@ local function availFn()
     return math.max(0, (e and e.size or 0) - (res[key] or 0))
   end
 end
-
 local function kitStock(kit, avail)
   if #kit.items == 0 then return 0 end
   local m = math.huge
@@ -1819,50 +1491,23 @@ local function kitStock(kit, avail)
   end
   return m
 end
-
 local function refreshRemaining()
   if not cache.time then return 0 end
   return math.max(0, math.ceil(CONFIG.REFRESH_COOLDOWN - (computer.uptime() - cache.time)))
 end
-
 local function ageText()
   if not cache.time then return "не сканировалась" end
   local s = math.floor(computer.uptime() - cache.time)
   if s < 60 then return s .. " с назад" end
   return math.floor(s / 60) .. " мин назад"
 end
-
-----------------------------------------------------------------------
--- PIM: инвентарь игрока
-----------------------------------------------------------------------
 local function stackInfo(st)
   local dmg = st.dmg or st.damage or 0
   return st.id or st.name, math.floor(tonumber(dmg) or 0), tonumber(st.qty or st.size) or 1,
          tonumber(st.max_size or st.maxSize) or 64, variantOf(st)
 end
-
--- читает 36 слотов: slots[s] = false (пусто) | {name,damage,qty,max,var} | nil (ошибка чтения)
--- Net.allStacksOk: nil - ещё не проверяли; true/false - работает ли pim.getAllStacks (не local: лимит 200 локальных)
 local function readSlots()
   local slots = {}
-  -- быстрый путь: один вызов вместо 36 (каждый вызов компонента стоит тик, ~1.8 с на весь инвентарь)
-  if Net.allStacksOk ~= false and pim.getAllStacks then
-    local ok, all = pcall(pim.getAllStacks)
-    if ok and type(all) == "table" and next(all) ~= nil then
-      for s = 1, 36 do
-        local st = all[s]
-        if type(st) == "table" and next(st) ~= nil then
-          local n, d, q, mx, v = stackInfo(st)
-          slots[s] = { name = n, damage = d, qty = q, max = mx, var = v }
-        else
-          slots[s] = false
-        end
-      end
-      Net.allStacksOk = true
-      return slots
-    end
-    if not ok then Net.allStacksOk = false end        -- метода нет / падает: дальше читаем по слотам
-  end
   for s = 1, 36 do
     local ok, st = pcall(pim.getStackInSlot, s)
     if ok then
@@ -1876,18 +1521,14 @@ local function readSlots()
   end
   return slots
 end
-
--- подходит ли стек из слота под запись (id + damage + вариант: жидкость / NBT-хеш)
 local function stackMatches(st, name, damage, var)
   if not st or st.name ~= name or st.damage ~= damage then return false end
   var = var or ""
   local sv = st.var or ""
   if sv == var then return true end
-  -- PIM не всегда отдаёт тип жидкости: стек без варианта подходит под запись с жидкостью
   if sv == "" and var ~= "" and var:sub(1, 1) ~= "#" then return true end
   return sameVariant(sv, var)
 end
-
 local function countIn(slots, name, damage, var)
   local c = 0
   for s = 1, 36 do
@@ -1896,8 +1537,6 @@ local function countIn(slots, name, damage, var)
   end
   return c
 end
-
--- сколько штук предмета ещё влезет в инвентарь (пустые слоты + недобитые стаки)
 local function spaceIn(slots, name, damage, maxSize, var)
   local space = 0
   for s = 1, 36 do
@@ -1910,8 +1549,6 @@ local function spaceIn(slots, name, damage, maxSize, var)
   end
   return space
 end
-
--- количество конкретного предмета в одном слоте (nil - ошибка чтения)
 local function slotQty(s, name, damage)
   local ok, st = pcall(pim.getStackInSlot, s)
   if not ok then return nil end
@@ -1920,15 +1557,11 @@ local function slotQty(s, name, damage)
   if n == name and d == damage then return q end
   return 0
 end
-
--- Список для выбора предметов из ИНВЕНТАРЯ игрока на PIM (тот же формат, что у pickerScan):
--- { name, damage, label, qty_в_инвентаре, maxSize, var }
 local function invPickerScan(filter)
   cache.items = {}
   return pcall(function()
     local words = {}
     for w in searchNorm(filter or ""):gmatch("%S+") do words[#words + 1] = w end
-
     local out, seen = {}, {}
     for s = 1, 36 do
       local ok, st = pcall(pim.getStackInSlot, s)
@@ -1966,14 +1599,6 @@ local function invPickerScan(filter)
     cache.items, cache.pickTotal, cache.pickMore = out, #out, false
   end)
 end
-
-----------------------------------------------------------------------
--- ЭКРАН: примитивы и сетка
---
---   колонка 1 и колонка W - пустые поля; содержимое занимает 2 .. W-1
---   строки: 1 шапка | 3-5 вкладки | 6 сообщение | 7+ содержимое (сдвиг UI.oy) |
---           список карточек по 3 строки + 1 пропуск | H-3..H-1 подвал (строка H пустая)
-----------------------------------------------------------------------
 local W, H = 160, 50
 local C = {
   bg = 0x101010, panel = 0x1e1e1e, panel2 = 0x2d2d2d, bar = 0x0a0a0a,
@@ -1981,30 +1606,23 @@ local C = {
   red = 0xff5555, blue = 0x2f5fb3, green = 0x2f7d1a, disabled = 0x262626,
   tabOn = 0x3a7d1e, tabOff = 0x2a2a2a, dlg = 0x2a2a2a,
 }
-local UI = { btns = {}, tag = nil, oy = 0 }   -- oy: сдвиг по Y для содержимого вкладок
-local CONTENT_OY = 1                          -- на сколько строк содержимое ниже базовой сетки
-
-local LIST_Y = 10       -- начало списка карточек на обычных экранах
-local SUB_Y  = 14       -- начало списка на вкладке «Создание»
-local BW     = 18       -- стандартная ширина кнопки в карточке
-local BW2    = 14       -- ширина кнопок, когда их две в ряд
-
--- положение текста внутри карточки (полоска 3 строки): было 0 и 2
+local UI = { btns = {}, tag = nil, oy = 0 }
+local CONTENT_OY = 1
+local LIST_Y = 10
+local SUB_Y  = 14
+local BW     = 18
+local BW2    = 14
 local CARD_TITLE_DY, CARD_SUB_DY = 0, 1
-
 local function fill(x, y, w, h, bg)
   if w <= 0 or h <= 0 then return end
   gpu.setBackground(bg)
   gpu.fill(x, y + UI.oy, w, h, " ")
 end
-
 local function text(x, y, s, fg, bg)
   gpu.setBackground(bg or C.bg)
   gpu.setForeground(fg or C.text)
   gpu.set(x, y + UI.oy, s)
 end
-
--- рамка из символов псевдографики (края окна, чтобы не сливались с фоном)
 local function frame(x, y, w, h, fg, bg)
   gpu.setBackground(bg or C.dlg)
   gpu.setForeground(fg or C.accent)
@@ -2013,13 +1631,10 @@ local function frame(x, y, w, h, fg, bg)
   gpu.fill(x, y + UI.oy + 1, 1, h - 2, "│")
   gpu.fill(x + w - 1, y + UI.oy + 1, 1, h - 2, "│")
 end
-
--- текст по центру экрана
 local function ctext(y, s, fg, bg)
   s = tostring(s)
   text(math.floor((W - unicode.len(s)) / 2) + 1, y, s, fg, bg)
 end
-
 local function addBtn(x, y, w, h, label, o)
   o = o or {}
   local bg = o.disabled and C.disabled or (o.bg or C.panel2)
@@ -2033,15 +1648,10 @@ local function addBtn(x, y, w, h, label, o)
     UI.btns[#UI.btns + 1] = { x = x, y = y + UI.oy, w = w, h = h, fn = o.fn, tag = UI.tag }
   end
 end
-
--- кнопка, прижатая к правому краю содержимого (последняя колонка = W-1).
--- off - отступ от правого края; возвращает отступ для следующей кнопки слева.
 local function rb(y, off, w, label, o)
   addBtn(W - off - w, y, w, 3, label, o)
   return off + w + 1
 end
-
--- карточка на всю ширину содержимого; reserve - сколько колонок справа занято кнопками
 local function card(y, title, sub, subColor, reserve)
   reserve = reserve or (BW + 2)
   local tw = math.max(1, W - reserve - 4)
@@ -2049,27 +1659,23 @@ local function card(y, title, sub, subColor, reserve)
   text(3, y + CARD_TITLE_DY, pad(title, tw), C.accent, C.panel)
   text(3, y + CARD_SUB_DY, pad(sub, tw), subColor or C.dim, C.panel)
 end
-
--- карточка в одну строку: Название (accent) + KIT_GAP колонок + информация.
--- Строка прижата к левому краю карточки и стоит по центру полоски по вертикали
--- (средняя из трёх). reserve - сколько колонок справа занято кнопками.
 local KIT_GAP = 10
 local PENCIL_W = 3
 local function lineCard(y, title, info, infoColor, reserve, onEdit)
   reserve = reserve or (BW + 2)
   fill(2, y, W - 2, 3, C.panel)
-  local x0 = 3                                          -- левый край (как у остальных карточек)
+  local x0 = 3
   local shift = 0
-  if onEdit then                                        -- маленький карандаш слева: переименовать
+  if onEdit then
     addBtn(x0, y, PENCIL_W, 3, "✎", { bg = C.blue, fg = 0xffffff, fn = onEdit })
     shift = PENCIL_W + 1
     x0 = x0 + shift
   end
-  local rw = math.max(10, W - reserve - 1 - shift)      -- ширина области: колонки 2 .. rw+1
+  local rw = math.max(10, W - reserve - 1 - shift)
   title, info = tostring(title), tostring(info)
   local li = unicode.len(info)
   local room = rw - 2 - KIT_GAP - li
-  if room < 6 then                                      -- не влезает: режем информацию
+  if room < 6 then
     info = unicode.sub(info, 1, math.max(1, rw - 2 - KIT_GAP - 6)); li = unicode.len(info)
     room = 6
   end
@@ -2078,20 +1684,13 @@ local function lineCard(y, title, info, infoColor, reserve, onEdit)
   text(x0, y + 1, title, C.accent, C.panel)
   text(x0 + lt + KIT_GAP, y + 1, info, infoColor or C.text, C.panel)
 end
-
-----------------------------------------------------------------------
--- СОСТОЯНИЕ
-----------------------------------------------------------------------
 local S = { player = nil }
--- 4) список окна выбора: освобождаем, только если окно выбора сейчас не открыто
 memReleasers[#memReleasers + 1] = function()
   if not (S.player and S.view == "pick") then cache.items = {} end
 end
 pendingOff = false
 local running = true
-local render, nav, flash, status   -- объявлены заранее
-
--- сообщение рисуется в собственной строке 6 (без сдвига), содержимое его не затирает
+local render, nav, flash, status
 local function drawMessage()
   local oy = UI.oy; UI.oy = 0
   fill(1, 6, W, 1, C.bg)
@@ -2100,7 +1699,6 @@ local function drawMessage()
   end
   UI.oy = oy
 end
-
 status = function(msg) S.msg = msg; S.msgOk = true; drawMessage() end
 flash  = function(msg, ok) S.msg = msg; S.msgOk = (ok ~= false); render() end
 nav = function(fields, msg, ok)
@@ -2109,9 +1707,6 @@ nav = function(fields, msg, ok)
   S.msg = msg or ""; S.msgOk = (ok ~= false)
   render()
 end
-
--- Ctrl+Alt+C: ожидание события бросает "interrupted". В режиме киоска глотаем это
--- и ждём дальше (в режиме debug ошибка пробрасывается, программу можно остановить).
 local function safePull(fn, ...)
   while true do
     local r = table.pack(pcall(fn, ...))
@@ -2120,13 +1715,9 @@ local function safePull(fn, ...)
     os.sleep(0.05)
   end
 end
-
--- Крестик «закрыть» внутри окна, в строке заголовка (справа, с отступом от рамки).
--- Esc в игре закрывает сам GUI экрана и до программы не доходит, поэтому отмена
--- делается касанием крестика.
 local CROSS_W, CROSS_H = 3, 1
 local function crossPos(bx, by, bw)
-  return bx + bw - CROSS_W - 2, by + 1     -- внутри рамки: 1 колонка отступа от правой границы
+  return bx + bw - CROSS_W - 2, by + 1
 end
 local function drawCross(bx, by, bw)
   local x, y = crossPos(bx, by, bw)
@@ -2140,7 +1731,6 @@ local function hitCross(e, bx, by, bw)
   return x >= cx and x <= cx + CROSS_W - 1
      and y == cy + UI.oy
 end
-
 local function prompt(title, initial, maxLen)
   maxLen = maxLen or 60
   local bw = math.min(W - 4, 80)
@@ -2149,10 +1739,10 @@ local function prompt(title, initial, maxLen)
   local buf = initial or ""
   local function draw()
     fill(bx, by, bw, bh, C.dlg)
-    frame(bx, by, bw, bh, C.accent, C.dlg)                 -- рамка окна
+    frame(bx, by, bw, bh, C.accent, C.dlg)
     text(bx + 2, by + 1, pad(title, bw - 6 - CROSS_W), C.gold, C.dlg)
     drawCross(bx, by, bw)
-    frame(bx + 2, by + 2, bw - 4, 3, C.dim, C.dlg)         -- рамка поля ввода
+    frame(bx + 2, by + 2, bw - 4, 3, C.dim, C.dlg)
     fill(bx + 3, by + 3, bw - 6, 1, 0x000000)
     local shown, room = buf, bw - 8
     if unicode.len(shown) > room then shown = unicode.sub(shown, unicode.len(shown) - room + 1) end
@@ -2182,19 +1772,16 @@ local function prompt(title, initial, maxLen)
     end
   end
 end
-
 local function askNumber(title, initial, integer)
   local s = prompt(title, initial and tostring(initial) or "", 12)
   if not s then return nil end
   s = trim((s:gsub(",", ".")))
-  if not s:match("^%d+%.?%d*$") then return nil end     -- только обычная запись: без 0x10, 1e300, inf
+  if not s:match("^%d+%.?%d*$") then return nil end
   local n = tonumber(s)
   if not n or n ~= n or n < 0 or n > 10000000 then return nil end
   if integer then n = math.floor(n) end
   return n
 end
-
--- цена: строго больше нуля
 local function askPrice(title, initial)
   local v = askNumber(title, initial, false)
   if v and round2(v) <= 0 then
@@ -2203,14 +1790,13 @@ local function askPrice(title, initial)
   end
   return v
 end
-
 local function modal(title, body)
   local bw = math.min(W - 4, 100)
   local lines = wrap(body, bw - 4)
   local bh = #lines + 5
   local bx, by = math.floor((W - bw) / 2) + 1, math.max(2, math.floor((H - bh) / 2) + 1)
   fill(bx, by, bw, bh, C.dlg)
-  frame(bx, by, bw, bh, C.gold, C.dlg)                     -- рамка окна
+  frame(bx, by, bw, bh, C.gold, C.dlg)
   text(bx + 2, by + 1, pad(title, bw - 6 - CROSS_W), C.gold, C.dlg)
   drawCross(bx, by, bw)
   for i, l in ipairs(lines) do text(bx + 2, by + 2 + i, l, C.text, C.dlg) end
@@ -2222,15 +1808,10 @@ local function modal(title, body)
     if not who or not S.player or lower(who) == lower(S.player.name) then return end
   end
 end
-
-----------------------------------------------------------------------
--- ДЕЙСТВИЯ: покупка, выдача, пополнение, обновление, отзывы
-----------------------------------------------------------------------
 local function scanInventory()
   status("Читаю инвентарь...")
   S.slots = readSlots()
 end
-
 local function verifyStock(kit)
   local res = reservedMap(true)
   local chk = {}
@@ -2238,13 +1819,10 @@ local function verifyStock(kit)
     local k = itemKey(it.name, it.damage, it.var)
     local real
     if (it.var or "") == "" then
-      -- обычный предмет: точный лёгкий запрос по одному id (без getAvailableItems)
       real = meCount(it.name, it.damage, it.var)
       if real == nil then return false, "ME-сеть недоступна. Попробуйте позже." end
       if cache.byKey[k] then cache.byKey[k].size = real end
     else
-      -- NBT-предмет: точный запрос требует полного списка ME (дорого по ОЗУ),
-      -- поэтому берём остаток из кэша; реальное наличие всё равно проверит doClaim при выдаче
       real = cache.byKey[k] and cache.byKey[k].size or 0
     end
     if real - (res[k] or 0) < it.qty then
@@ -2254,7 +1832,6 @@ local function verifyStock(kit)
   end
   return true, nil, chk
 end
-
 local function doBuy(kit)
   local p = getPlayer(S.player.name)
   if #kit.items == 0 then return flash("Комплект пуст.", false) end
@@ -2268,7 +1845,6 @@ local function doBuy(kit)
   status("Проверяю наличие ресурсов...")
   local ok, err, chk = verifyStock(kit)
   if not ok then return flash(err, false) end
-
   p.balance = round2(p.balance - kit.price)
   local pu = { id = Net.newPurchaseId(), kit = kit.name, items = {} }
   for _, it in ipairs(kit.items) do
@@ -2286,16 +1862,10 @@ local function doBuy(kit)
   nav({ view = "purchase", purchaseId = pu.id },
       "Оплачено! Заберите ресурсы кнопками «Забрать» (можно по одному, можно позже).", true)
 end
-
--- Отпечаток предмета для exportItem. Если в записи нет NBT-хеша (ME его не отдаёт, а предмет -
--- бак с жидкостью), ищем хеш среди предметов сети: перебираем getAvailableItems() с тем же id+dmg
--- и сравниваем жидкость в getItemDetail() с нужной.
 local lastExportErr
 local meFingerprintRaw
--- Кэшируем только маленький результат (fingerprint одного предмета), а не весь список ME:
--- при «Забрать всё» повторные выдачи одного и того же бака не качают getAvailableItems заново.
 local fpCache, fpCount = {}, 0
-memReleasers[#memReleasers + 1] = function() fpCache, fpCount = {}, 0 end           -- 3) отпечатки предметов
+memReleasers[#memReleasers + 1] = function() fpCache, fpCount = {}, 0 end
 local function meFingerprint(name, dmg, var)
   var = var or ""
   if var == "" then return { id = name, dmg = dmg } end
@@ -2310,11 +1880,9 @@ local function meFingerprint(name, dmg, var)
   end
   return f, err
 end
-
 meFingerprintRaw = function(name, dmg, var)
   var = var or ""
   if var == "" then return { id = name, dmg = dmg } end
-  -- если хеш известен, getAvailableItems не нужен вообще
   if var:sub(1, 1) == "#" then return { id = name, dmg = dmg, nbt_hash = var:sub(2) } end
   local ok, list = pcall(me.getAvailableItems)
   if not ok or type(list) ~= "table" then
@@ -2341,18 +1909,14 @@ meFingerprintRaw = function(name, dmg, var)
   end
   return nil, "бак не найден в ME (var=" .. var:sub(1, 12) .. ")"
 end
-
 local function doClaim(pu, it, quiet)
-  -- quiet: массовая выдача, итог показывает claimAll; возвращает "ok" | "space" | "me" | "fail"
   local function out(msg, ok)
     if quiet then S.msg = msg; S.msgOk = (ok ~= false) else flash(msg, ok) end
   end
-  -- в сообщениях хеш не показываем
   local shown = tostring(it.label):gsub("%s*#[%w_%-]+", ""):gsub("%s*%(%s*%)", "")
   if it.qty <= 0 then return "ok" end
   local key = itemKey(it.name, it.damage, it.var)
   local maxSize = (cache.byKey[key] and cache.byKey[key].maxSize) or 64
-
   status("Проверяю место в инвентаре...")
   local slots = readSlots()
   local space = spaceIn(slots, it.name, it.damage, maxSize, it.var)
@@ -2366,21 +1930,17 @@ local function doClaim(pu, it, quiet)
     out("Ресурса сейчас нет в ME. Напишите владельцу через «Обратная связь».", false)
     return "me"
   end
-
   local fp, fpErr = meFingerprint(it.name, it.damage, it.var)
   if not fp then out("Не могу выдать «" .. shown .. "»: " .. tostring(fpErr), false); return "fail" end
   local deliver = math.min(it.qty, space, real)
   local bySpace = space < it.qty and space <= real
   local before = countIn(slots, it.name, it.damage, it.var)
-
-  -- сначала списываем в базе (чтобы при сбое питания выдача не удвоилась)
   it.qty = it.qty - deliver
   saveDB()
-
   status("Выдаю...")
   local left = deliver
   lastExportErr = nil
-  local exported, sure = 0, true          -- exported: сумма, которую ME сама сообщила о выданном
+  local exported, sure = 0, true
   while left > 0 do
     local chunk = math.min(left, maxSize)
     local ok, res = pcall(me.exportItem, fp, CONFIG.ME_EXPORT_SIDE, chunk)
@@ -2391,13 +1951,9 @@ local function doClaim(pu, it, quiet)
       if moved == 0 then lastExportErr = "exportItem вернул 0"; break end
       exported = exported + moved
       left = left - moved
-      if moved < chunk then break end                 -- ME отдала меньше: в инвентаре кончилось место
+      if moved < chunk then break end
     end
   end
-
-  -- Сколько реально выдано. Главный источник - ответ самой ME (exportItem): сравнение инвентаря «до/после»
-  -- не работает для предметов с NBT (PIM не отдаёт хеш, предмет не находится по ключу и счёт равен нулю),
-  -- из-за чего выданное возвращалось обратно в «Незабранное». Инвентарь читаем только если ME ответ не дала.
   local given
   if sure then
     given = math.max(0, math.min(deliver, exported))
@@ -2412,7 +1968,6 @@ local function doClaim(pu, it, quiet)
             .. (it.qty > 0 and (" (осталось " .. it.qty .. ")") or ""), 0, getPlayer(S.player.name).balance)
   end
   saveDB()
-
   if given == 0 then
     local extra = ""
     if S.player.owner and lastExportErr then extra = " [" .. lastExportErr:sub(1, 80) .. "]" end
@@ -2426,8 +1981,6 @@ local function doClaim(pu, it, quiet)
   out("Выдано: " .. shown .. " x" .. given, true)
   return "ok"
 end
-
--- «Забрать всё»: выдаём ресурсы по очереди, пока есть место в инвентаре
 local function claimAll(pu)
   local total, noMe, stopSpace = 0, 0, false
   status("Выдаю всё по очереди...")
@@ -2445,35 +1998,26 @@ local function claimAll(pu)
   elseif noMe > 0 then msg = msg .. " Не удалось выдать позиций: " .. noMe .. " (нет в ME или ошибка)." end
   flash(msg, total > 0 or not (stopSpace or noMe > 0))
 end
-
--- Пополнение: pim.pushItem толкает предмет из слота игрока в соседний инвентарь (ME Interface).
--- Если сторона из CONFIG не подошла, перебираем остальные и запоминаем ту, через которую
--- предмет реально ушёл (проверяем по слоту).
 local ALL_SIDES = { "north", "south", "east", "west", "up", "down" }
 local pushSideOk, lastPushErr = nil, nil
-
--- толкает предмет из слота в ME; возвращает, сколько реально ушло
 local function pushFromSlot(s, take, name, damage)
   local before = slotQty(s, name, damage)
   if not before or before <= 0 then return 0 end
   take = math.min(take, before)
-
-  -- порядок: ранее сработавшая, из CONFIG, потом все остальные
   local sides, seen = {}, {}
   local function add(x) if x and not seen[x] then seen[x] = true; sides[#sides + 1] = x end end
   add(pushSideOk)
   add(lower(CONFIG.PIM_PUSH_SIDE))
   for _, x in ipairs(ALL_SIDES) do add(x) end
-
   for _, side in ipairs(sides) do
     local variants = (side == side:upper()) and { side } or { side, side:upper() }
     for _, variant in ipairs(variants) do
       local ok, res = pcall(pim.pushItem, variant, s, take)
       if ok then
         local after = slotQty(s, name, damage)
-        if after == nil then os.sleep(0.1); after = slotQty(s, name, damage) end   -- чтение могло мигнуть
+        if after == nil then os.sleep(0.1); after = slotQty(s, name, damage) end
         if after and before - after > 0 then
-          pushSideOk = variant      -- запомнили рабочую сторону
+          pushSideOk = variant
           return before - after
         end
       else
@@ -2483,53 +2027,40 @@ local function pushFromSlot(s, take, name, damage)
   end
   return 0
 end
-
 local function doDeposit(e, amount)
   status("Читаю инвентарь...")
   local before = readSlots()
   local have = countIn(before, e.name, e.damage, e.var)
   local want = amount and math.min(amount, have) or have
   if want <= 0 then return flash("В инвентаре нет «" .. e.label .. "».", false) end
-
-  local pf, pfWhy = Net.preflight(status)                  -- до того, как предметы уйдут в ME
+  local pf, pfWhy = Net.preflight(status)
   if not pf then return flash(pfWhy, false) end
-
-  -- раньше завершаем недозачисленное из прошлых пополнений (если оно есть)
   pcall(Net.outboxRetry, S.player.name)
-
-  -- 1) НАМЕРЕНИЕ: записываем (ник, предмет, цена, сколько вносим) ДО того как забрать предметы.
-  -- Не записалось - предметы не трогаем.
   status("Записываю намерение пополнения...")
   local iid = Net.depositBegin({ player = S.player.name, name = e.name, damage = e.damage, var = e.var,
                                  label = e.label, price = e.price, want = want })
   if not iid then
     return flash("Не удалось записать пополнение в журнал. Предметы не тронуты, повторите позже.", false)
   end
-
   status("Принимаю ресурсы...")
   lastPushErr = nil
-  -- Между первым чтением инвентаря и этим местом прошли запросы к серверу (секунды): игрок мог переложить
-  -- предметы (например, в переносную ячейку). Поэтому читаем инвентарь ЗАНОВО и работаем только с ним.
   local fresh = readSlots()
   local unreadable = false
   for s = 1, 36 do if fresh[s] == nil then unreadable = true end end
   local haveNow = countIn(fresh, e.name, e.damage, e.var)
   local wantNow = math.min(want, haveNow)
   if unreadable or wantNow <= 0 then
-    pcall(Net.depositEnd, iid, 0, S.player.name)            -- ничего не трогали: намерение отменяем
+    pcall(Net.depositEnd, iid, 0, S.player.name)
     S.slots = readSlots()
     return flash(unreadable and "Не удалось прочитать инвентарь (встаньте на PIM и повторите)."
                  or "Предметы пропали из инвентаря до приёма. Пополнение отменено.", false)
   end
-  -- Сверка с ME: запоминаем, сколько предмета в сети ДО приёма. ME недоступна - ничего не трогаем.
   local meBefore = meCount(e.name, e.damage, e.var)
   if meBefore == nil then
     pcall(Net.depositEnd, iid, 0, S.player.name)
     S.slots = readSlots()
     return flash("ME-сеть недоступна. Предметы не тронуты, повторите позже.", false)
   end
-  -- Засчитываем ТОЛЬКО то, что реально передал pushItem (сумма по слотам), а не «разницу в инвентаре»:
-  -- иначе всё, что игрок убрал сам, выглядело бы как внесённое в ME.
   local left, moved = wantNow, 0
   for s = 1, 36 do
     if left <= 0 then break end
@@ -2543,14 +2074,11 @@ local function doDeposit(e, amount)
   moved = math.min(moved, wantNow)
   S.slots = readSlots()
   if moved <= 0 then
-    pcall(Net.depositEnd, iid, 0, S.player.name)           -- ничего не ушло: намерение отменяем
+    pcall(Net.depositEnd, iid, 0, S.player.name)
     local msg = "Не удалось принять предметы. Проверьте подключение ME Interface к PIM и свободное место в ME."
     if S.player.owner and lastPushErr then msg = msg .. " [" .. lastPushErr:sub(1, 80) .. "]" end
     return flash(msg, false)
   end
-
-  -- Сверка с ME ПОСЛЕ приёма: предметы доходят до сети не мгновенно, поэтому ждём до ~6 секунд, пока
-  -- количество в ME не вырастет минимум на moved. Зачисляем не больше, чем реально прибавилось в ME.
   status("Сверяю с ME...")
   local meAfter, delta
   for _ = 1, 12 do
@@ -2562,8 +2090,6 @@ local function doDeposit(e, amount)
     os.sleep(0.5)
   end
   if delta == nil then
-    -- ME не ответила: предметы, скорее всего, приняты, но подтверждения нет. Намерение остаётся (при
-    -- следующем запуске станет «unknown» и попадёт к владельцу на ручную проверку); деньги не начисляем.
     pcall(Net.fbAddEntry, "[сервер]", "Пополнение " .. S.player.name .. ": " .. e.label .. " x" .. moved ..
           " - ME не подтвердила приём, зачисление отложено. Проверьте вручную (Журнал -> Намерения).")
     return flash("Предметы приняты, но ME не подтвердила приём. Зачисление проверит владелец.", false)
@@ -2578,11 +2104,8 @@ local function doDeposit(e, amount)
       return flash("ME не подтвердила приём предметов. Пополнение не зачислено.", false)
     end
   end
-
   local c = cache.byKey[itemKey(e.name, e.damage, e.var)]
   if c then c.size = c.size + moved end
-
-  -- 2-3) предметы уже в ME: зачисляем. Не вышло - зачисление повторится при следующем входе или запуске
   status("Зачисляю на баланс...")
   local okE, r = pcall(Net.depositEnd, iid, moved, S.player.name)
   if okE and r then
@@ -2591,10 +2114,9 @@ local function doDeposit(e, amount)
   flash("Принято " .. moved .. " шт. «" .. e.label .. "» (" .. fmt(round2(moved * e.price)) .. " " .. CONFIG.CURRENCY ..
         "), но зачисление задержалось. Оно сохранено и будет завершено автоматически при следующем входе.", false)
 end
-
 local function doRefresh()
   if refreshRemaining() > 0 then return end
-  if MODE == "terminal" then pcall(Net.pullConfig) end      -- подтянуть правки владельца с других терминалов
+  if MODE == "terminal" then pcall(Net.pullConfig) end
   status("Сканирую ME-сеть...")
   local ok, err = scanME(S.player and S.player.name, S.player and S.player.owner)
   if ok and S.player and S.player.owner and S.view == "pick" then
@@ -2603,14 +2125,10 @@ local function doRefresh()
   end
   if ok then flash("Список обновлён.", true)
   else
-    -- технический текст ошибки видит только владелец
     flash("Не удалось просканировать ME." ..
           ((S.player and S.player.owner) and (" " .. tostring(err)) or ""), false)
   end
 end
-
--- открыть окно выбора предмета (только владелец).
--- source: "me" - из ME-сети (по умолчанию), "inv" - из инвентаря игрока на PIM
 local function openPicker(mode, source)
   source = source or "me"
   status(source == "inv" and "Читаю инвентарь..." or "Загружаю список ME...")
@@ -2620,7 +2138,6 @@ local function openPicker(mode, source)
   if ok then nav(f)
   else nav(f, "Не удалось получить список: " .. tostring(err), false) end
 end
-
 local feedbackLast = {}
 local function sendFeedback()
   local k = lower(S.player.name)
@@ -2635,11 +2152,6 @@ local function sendFeedback()
   Net.fbAddEntry(S.player.name, trim(txt))
   flash("Спасибо! Сообщение отправлено владельцу.", true)
 end
-
-----------------------------------------------------------------------
--- ВЫВОД: баланс -> один предмет, заданный владельцем (db.withdraw)
-----------------------------------------------------------------------
--- сколько штук игрок может вывести прямо сейчас: баланс, место в инвентаре, остаток в ME
 local function withdrawMax()
   local w = db.withdraw
   local p = getPlayer(S.player.name)
@@ -2655,8 +2167,6 @@ local function withdrawMax()
   if avail <= 0 then return 0, "Предмета сейчас нет в ME." end
   return math.max(0, math.min(byBal, space, avail))
 end
-
--- окно вывода: возвращает количество или nil (отмена)
 local function withdrawDialog()
   local w = db.withdraw
   local bw, bh = math.min(W - 4, 70), 13
@@ -2723,7 +2233,6 @@ local function withdrawDialog()
     end
   end
 end
-
 local function doWithdraw(q)
   local w = db.withdraw
   if not w then return flash("Вывод не настроен владельцем.", false) end
@@ -2742,8 +2251,6 @@ local function doWithdraw(q)
   if real - (reservedMap(true)[k] or 0) < q then
     return flash("В ME недостаточно предмета для вывода.", false)
   end
-
-  -- списываем баланс и оформляем выдачу как покупку (дальше работает обычная надёжная выдача)
   p.balance = round2(p.balance - cost)
   local it = { name = w.name, damage = w.damage, var = w.var, label = w.label,
                customLabel = w.customLabel, qty = q }
@@ -2756,7 +2263,6 @@ local function doWithdraw(q)
   else
     saveDB()
   end
-
   doClaim(pu, it, true)
   local left = it.qty
   purgePurchases(p)
@@ -2766,7 +2272,6 @@ local function doWithdraw(q)
     flash("Выдано " .. (q - left) .. " из " .. q .. ". Остаток ждёт в «Незабранное» (освободите место).", true)
   end
 end
-
 local function openWithdraw()
   if not db.withdraw then
     return flash("Вывод пока не настроен владельцем.", false)
@@ -2775,11 +2280,6 @@ local function openWithdraw()
   if pendingOff then return end
   if q then doWithdraw(q) else render() end
 end
-
-----------------------------------------------------------------------
--- ЭКРАНЫ
-----------------------------------------------------------------------
--- сколько карточек влезает: от строки y0 до подвала, шаг 4 (3 строки + пропуск)
 local function paged(count, y0)
   local per = math.max(1, math.floor((H - 2 - y0 - UI.oy) / 4))
   local pages = math.max(1, math.ceil(count / per))
@@ -2789,11 +2289,9 @@ local function paged(count, y0)
   local first = (S.page - 1) * per + 1
   return first, math.min(count, first + per - 1)
 end
-
----------------------------------------------------------- заставка (экран ожидания)
-local SPL_BAND = 5            -- высота полосы фонового градиента, строк
+local SPL_BAND = 5
 local SPL_BOX_W, SPL_BOX_H = 40, 5
-local SPL_GLYPH = {           -- крупные буквы: # = закрашено
+local SPL_GLYPH = {
   ["К"] = { "#   #", "#  # ", "###  ", "#  # ", "#   #" },
   ["В"] = { "#### ", "#   #", "#### ", "#   #", "#### " },
   ["Е"] = { "#####", "#    ", "#### ", "#    ", "#####" },
@@ -2804,7 +2302,6 @@ local SPL_GLYPH = {           -- крупные буквы: # = закрашен
 local SPL_WORD = "КВЕСТЫ"
 local splashStep = 0
 local splashStars = {}
-
 local function mix(a, b, t)
   local function ch(c, d) return math.floor(c / d) % 256 end
   local r  = math.floor(ch(a, 65536) * (1 - t) + ch(b, 65536) * t + 0.5)
@@ -2812,19 +2309,16 @@ local function mix(a, b, t)
   local bl = math.floor((a % 256)    * (1 - t) + (b % 256)    * t + 0.5)
   return r * 65536 + g * 256 + bl
 end
-
 local function skyAt(y)
   local bands = math.max(1, math.ceil(H / SPL_BAND))
   local i = math.floor((y - 1) / SPL_BAND)
   return mix(0x0a1024, 0x2b1246, i / math.max(1, bands - 1))
 end
-
 local function spaced(s)
   local t = {}
   for i = 1, unicode.len(s) do t[#t + 1] = unicode.sub(s, i, i) end
   return table.concat(t, " ")
 end
-
 local function splashGeom()
   local g = {}
   g.sx = (W >= 120) and 3 or 2
@@ -2843,7 +2337,6 @@ local function splashGeom()
   g.boxY = g.divY + 3
   return g
 end
-
 local function makeStars(g)
   splashStars = {}
   local seed = 20260
@@ -2854,7 +2347,6 @@ local function makeStars(g)
     if not inside then splashStars[#splashStars + 1] = { x = x, y = y, ph = rnd(3), k = rnd(4) } end
   end
 end
-
 local STAR_COL = { 0x3a4a7a, 0x8fa4e8, 0xffffff }
 local function drawStars(onlyThird)
   for i, st in ipairs(splashStars) do
@@ -2865,7 +2357,6 @@ local function drawStars(onlyThird)
     end
   end
 end
-
 local function drawSplashFrame()
   local fg = 0x2f7d1a
   gpu.setForeground(fg)
@@ -2881,10 +2372,9 @@ local function drawSplashFrame()
     end
   end
 end
-
 local function drawTitle(g)
   local n = unicode.len(SPL_WORD)
-  for pass = 1, 2 do                       -- 1 = тень, 2 = сами буквы
+  for pass = 1, 2 do
     local x = g.gx
     for i = 1, n do
       local glyph = SPL_GLYPH[unicode.sub(SPL_WORD, i, i)]
@@ -2909,7 +2399,6 @@ local function drawTitle(g)
     end
   end
 end
-
 local function drawSplashPrompt(g, bright)
   local bg = 0x121833
   gpu.setBackground(bg)
@@ -2923,11 +2412,9 @@ local function drawSplashPrompt(g, bright)
   gpu.setForeground(bright and 0x68f029 or 0x3a7d1e)
   gpu.set(g.boxX + math.floor((SPL_BOX_W - unicode.len(s)) / 2), g.boxY + math.floor(SPL_BOX_H / 2), s)
 end
-
 local function drawIdle()
   UI.oy = 0
   local g = splashGeom()
-  -- фон: ступенчатый градиент
   for i = 0, math.ceil(H / SPL_BAND) - 1 do
     local y0 = i * SPL_BAND + 1
     gpu.setBackground(skyAt(y0))
@@ -2937,10 +2424,7 @@ local function drawIdle()
   drawStars(false)
   drawSplashFrame()
   drawTitle(g)
-
 end
-
--- вызывается раз в ~0.7 с, пока на PIM никого нет: мерцание звёзд и «дыхание» надписи
 local function idleTick()
   if S.player then return end
   UI.oy = 0
@@ -2948,15 +2432,13 @@ local function idleTick()
   drawStars(true)
   drawSplashPrompt(splashGeom(), splashStep % 2 == 0)
 end
-
 local function switchTab(t)
   S.tab = t; S.view = "list"; S.csub = "kits"; S.page = 1; S.pview = false
   S.msg = ""; S.confirm = nil; S.filter = ""
-  if #cache.items > 0 then cache.items = {}; ru.unload() end     -- ушли из окна выбора: освобождаем
+  if #cache.items > 0 then cache.items = {}; ru.unload() end
   if t == "topup" then scanInventory() end
   render()
 end
-
 local function drawHeader()
   fill(1, 1, W, 1, C.bar)
   local bal = "Баланс: " .. fmt(getPlayer(S.player.name).balance) .. " " .. CONFIG.CURRENCY
@@ -2965,7 +2447,6 @@ local function drawHeader()
   addBtn(W - balW - 10, 1, 8, 1, "Вывод", { bg = db.withdraw and C.tabOn or C.panel2, fg = 0xffffff, fn = openWithdraw })
   local who = S.player.name .. (S.player.owner and " [владелец]" or "")
   text(20, 1, pad(who, math.max(1, W - balW - 32)), C.text, C.bar)
-
   local tabs = { { "kits", "Квесты/Комплекты" }, { "topup", "Пополнение" } }
   if S.player.owner then tabs[#tabs + 1] = { "create", "Создание" } end
   local n = #tabs
@@ -2978,9 +2459,8 @@ local function drawHeader()
       { bg = on and C.tabOn or C.tabOff, fg = on and 0xffffff or C.dim, fn = function() switchTab(t[1]) end })
   end
 end
-
 local function drawFooter()
-  local y = H - 3                          -- кнопки на 1 строку выше нижнего края
+  local y = H - 3
   fill(1, y, W, 4, C.bar)
   addBtn(2, y, 14, 3, "Назад", { disabled = not S.backFn, fn = S.backFn })
   addBtn(18, y, 6, 3, "<", { disabled = S.page <= 1, fn = function() S.page = S.page - 1; render() end })
@@ -2991,15 +2471,12 @@ local function drawFooter()
     { disabled = rem > 0, bg = C.green, fn = doRefresh })
   rb(y, 0, 20, "Обратная связь", { bg = C.blue, fn = sendFeedback })
 end
-
 local function redrawFooter()
   local keep = {}
   for _, b in ipairs(UI.btns) do if b.tag ~= "foot" then keep[#keep + 1] = b end end
   UI.btns = keep
   UI.tag = "foot"; drawFooter(); UI.tag = nil
 end
-
----------------------------------------------------------- вкладка: комплекты
 local function screenKitView()
   local kit = findKit(S.kitId)
   if not kit then S.view = "list"; return false end
@@ -3010,7 +2487,6 @@ local function screenKitView()
        stock > 0 and C.text or C.red, C.bg)
   rb(6, 0, 30, "Купить за " .. fmt(kit.price),
     { disabled = stock <= 0, bg = C.tabOn, fn = function() doBuy(kit) end })
-
   local first, last = paged(#kit.items, LIST_Y)
   for i = first, last do
     local it = kit.items[i]
@@ -3022,7 +2498,6 @@ local function screenKitView()
   S.backFn = function() nav({ view = "list" }) end
   return true
 end
-
 local function screenPurchase(p)
   local pu = findPurchase(p, S.purchaseId)
   if not pu then S.view = "mine"; return false end
@@ -3045,7 +2520,6 @@ local function screenPurchase(p)
   end
   return true
 end
-
 local function screenMine(p)
   purgePurchases(p)
   text(2, 6, "Незабранные покупки", C.accent, C.bg)
@@ -3061,14 +2535,12 @@ local function screenMine(p)
   S.backFn = function() nav({ view = "list" }) end
   return true
 end
-
 local function screenKits()
   local p = getPlayer(S.player.name)
   if S.view == "kit" and screenKitView() then return end
   if S.view == "purchase" and screenPurchase(p) then return end
   if S.view == "mine" and screenMine(p) then return end
   S.view = "list"
-
   local avail = availFn()
   local list = {}
   for _, k in ipairs(db.kits) do if #k.items > 0 then list[#list + 1] = k end end
@@ -3077,7 +2549,6 @@ local function screenKits()
   text(2, 8, "Остатки ME: " .. ageText(), C.dim, C.bg)
   rb(6, 0, 30, "Незабранное: " .. pend,
     { disabled = (pend == 0), bg = C.gold, fg = 0x000000, fn = function() nav({ view = "mine" }) end })
-
   local first, last = paged(#list, LIST_Y)
   if #list == 0 then text(2, LIST_Y, "Владелец ещё не добавил комплекты.", C.dim, C.bg) end
   for i = first, last do
@@ -3090,14 +2561,11 @@ local function screenKits()
       { disabled = stock <= 0, bg = C.tabOn, fn = function() nav({ view = "kit", kitId = k.id }) end })
   end
 end
-
----------------------------------------------------------- вкладка: пополнение
 local function screenTopup()
   local p = getPlayer(S.player.name)
   text(2, 6, "Положите ресурсы в инвентарь и нажмите «Внести всё» или «Ввести число».", C.accent, C.bg)
   text(2, 8, "Баланс: " .. fmt(p.balance) .. " " .. CONFIG.CURRENCY, C.gold, C.bg)
   rb(6, 0, 30, "Проверить инвентарь", { fn = function() scanInventory(); render() end })
-
   local list = db.topup
   local first, last = paged(#list, LIST_Y)
   if #list == 0 then text(2, LIST_Y, "Владелец ещё не добавил ресурсы для пополнения.", C.dim, C.bg) end
@@ -3116,15 +2584,13 @@ local function screenTopup()
       { disabled = have <= 0, bg = C.tabOn, fn = function() doDeposit(e, nil) end })
   end
 end
-
----------------------------------------------------------- вкладка: создание (владелец)
 local function subBar()
   local unread = unreadFeedback()
   local subs = { { "kits", "Комплекты" }, { "topup", "Ресурсы пополнения" }, { "withdraw", "Вывод" },
                  { "feedback", "Отзывы" .. (unread > 0 and (" (" .. unread .. ")") or "") },
                  { "journal", "Журнал" }, { "balances", "Балансы" } }
   local exitW, gap = 14, 1
-  local region = (W - 2) - exitW - gap            -- ширина под подвкладки (колонки 2 .. W-1-exitW-gap)
+  local region = (W - 2) - exitW - gap
   local bw = math.floor((region - gap * (#subs - 1)) / #subs)
   for i, s in ipairs(subs) do
     local on = (S.csub == s[1])
@@ -3137,9 +2603,6 @@ local function subBar()
       if S.confirm == "exit" then running = false else S.confirm = "exit"; render() end
     end })
 end
-
--- переименование ресурса (запись комплекта или ресурса пополнения) по карандашу на карточке.
--- Пустое название - вернуть автоматическое (русское из словаря / из ME).
 local function renameEntry(entry)
   local nm = prompt("Название ресурса (пусто - сбросить):", entry.label, 60)
   if nm == nil then return render() end
@@ -3156,7 +2619,6 @@ local function renameEntry(entry)
   saveDB()
   render()
 end
-
 local function screenKitEdit()
   local kit = findKit(S.kitId)
   if not kit then S.view = "list"; return false end
@@ -3185,7 +2647,6 @@ local function screenKitEdit()
         nav({ view = "list" }, "Комплект удалён.", true)
       else S.confirm = "del" .. kit.id; render() end
     end })
-
   text(2, 9, pad("Комплект: " .. kit.name .. "   Цена: " .. fmt(kit.price) .. " " .. CONFIG.CURRENCY ..
        "   Склад: " .. kitStock(kit, availFn()) .. " шт", W - 2), C.accent, C.bg)
   local y0 = LIST_Y + 1
@@ -3196,7 +2657,6 @@ local function screenKitEdit()
     local it = kit.items[i]
     local y = y0 + (i - first) * 4
     local c = cache.byKey[itemKey(it.name, it.damage, it.var)]
-    -- одна строка, как у остальных карточек
     lineCard(y, it.label .. "   [" .. it.name .. ":" .. it.damage .. "]",
              "x" .. it.qty .. "   В ME: " .. (c and c.size or 0), C.text, reserve,
              function() renameEntry(it) end)
@@ -3212,19 +2672,15 @@ local function screenKitEdit()
   S.backFn = function() nav({ view = "list" }) end
   return true
 end
-
--- e = { name, damage, label, size, maxSize, var }
 local function pickItem(e)
   local name, dmg, label, size, mx, var = e[1], e[2], e[3], e[4], e[5], e[6] or ""
   local k = itemKey(name, dmg, var)
   if S.pickSource == "inv" then
-    -- size в списке - это количество у игрока на руках, а остаток в ME берём отдельно.
-    -- Вариант (жидкость/хеш) приводим к тому, каким его видит ME, иначе остатки не сойдутся.
     local mv, msize = meResolve(name, dmg, var)
     if mv then
       var = mv; size = msize
       local base = e[3]
-      if (e[6] or "") ~= "" then base = (base:gsub(" %b()$", "")) end   -- убираем вариант PIM из названия
+      if (e[6] or "") ~= "" then base = (base:gsub(" %b()$", "")) end
       label = base
       if var ~= "" then label = label .. " (" .. ((var:sub(1, 1) == "#") and var:sub(1, 7) or var) .. ")" end
     else
@@ -3266,7 +2722,6 @@ local function pickItem(e)
     flash("Ресурс пополнения сохранён: " .. label .. " по " .. fmt(price), true)
   end
 end
-
 local function applyPickFilter(f)
   S.filter = f; S.page = 1
   status(S.pickSource == "inv" and "Ищу в инвентаре..." or "Ищу в ME...")
@@ -3276,7 +2731,6 @@ local function applyPickFilter(f)
   if not ok then return flash("Не удалось получить список: " .. tostring(err), false) end
   render()
 end
-
 local function screenPick()
   local hasFilter = S.filter and S.filter ~= ""
   addBtn(2, 6, 44, 3, "Поиск: " .. (hasFilter and S.filter or "(нажмите)"), { fn = function()
@@ -3286,11 +2740,10 @@ local function screenPick()
   addBtn(48, 6, 16, 3, "Сбросить", { disabled = not hasFilter, fn = function() applyPickFilter("") end })
   local fromInv = (S.pickSource == "inv")
   local info = "Найдено: " .. cache.pickTotal .. (cache.pickMore and ("  (показаны первые " .. #cache.items .. ", уточните поиск)") or "")
-  info = info .. "   [свободно ОЗУ: " .. math.floor(computer.freeMemory() / 1024) .. " КБ]"   -- диагностика для владельца
+  info = info .. "   [свободно ОЗУ: " .. math.floor(computer.freeMemory() / 1024) .. " КБ]"
   text(66, 6, pad(info, W - 66), C.dim, C.bg)
   text(66, 8, pad(fromInv and "Источник: ваш инвентарь (кол-во - у вас на руках)"
                   or ("Данные ME: " .. ageText()), W - 66), C.dim, C.bg)
-
   local list = cache.items
   local first, last = paged(#list, LIST_Y)
   if #list == 0 then
@@ -3301,31 +2754,25 @@ local function screenPick()
   for i = first, last do
     local e = list[i]
     local y = LIST_Y + (i - first) * 4
-    -- одна строка, как у остальных карточек
     lineCard(y, e[3] .. "   [" .. e[1] .. ":" .. e[2] .. "]", (fromInv and "У вас: " or "В ME: ") .. e[4], C.text)
     rb(y, 0, BW, "Выбрать", { bg = C.tabOn, fn = function() pickItem(e) end })
   end
   S.backFn = function()
-    cache.items = {}                       -- освобождаем память
-    ru.unload()                            -- и словарь переводов (нужен только владельцу в этом окне)
+    cache.items = {}
+    ru.unload()
     if S.pickMode == "kit" then nav({ view = "edit", filter = "" })
     elseif S.pickMode == "withdraw" then nav({ view = "list", csub = "withdraw", filter = "" })
     else nav({ view = "list", csub = "topup", filter = "" }) end
   end
 end
-
----------------------------------------------------------- вкладки владельца: журнал и балансы
-UI.os = {}          -- экраны владельца лежат в таблице UI: свободных локальных переменных (лимит 200) не осталось
+UI.os = {}
 UI.os.KINDS = { { "", "Все" }, { "buy", "Покупки" }, { "deposit", "Пополнения" }, { "withdraw", "Вывод" },
                    { "claim", "Выдача" }, { "edit", "Правки" }, { "intent", "Намерения" } }
 UI.os.NAME  = { buy = "Покупка", deposit = "Пополнение", withdraw = "Вывод", claim = "Выдача",
                    edit = "Правка", intent = "Намерение" }
 UI.os.CLR   = { buy = 0xdddddd, deposit = 0x68f029, withdraw = 0xf2b233, claim = 0x888888,
                    edit = 0x66aaff, intent = 0xff5555 }
-
 function UI.os.errText(e) return (tostring(e):gsub("^.-USERMSG:", "")) end
-
--- журнал операций: одна строка = одна запись, новые сверху
 function UI.os.journal()
   S.jk = S.jk or 1
   local kind = UI.os.KINDS[S.jk]
@@ -3349,20 +2796,18 @@ function UI.os.journal()
     text(2, SUB_Y, pad("Не удалось загрузить журнал: " .. UI.os.errText(list), W - 2), C.red, C.bg)
     return
   end
-
   local rows = {}
   for i = #list, 1, -1 do
     local e = list[i]
     if kind[1] == "" or e.kind == kind[1] then rows[#rows + 1] = e end
   end
-  local dx, bx = W - 26, W - 13                     -- колонки «изменение» и «баланс»
+  local dx, bx = W - 26, W - 13
   local tw = dx - 45
   text(3, SUB_Y - 1, pad("Время", 11) .. pad("Игрок", 17) .. pad("Тип", 13) .. pad("Что произошло", tw), C.dim, C.bg)
   text(dx, SUB_Y - 1, pad("Изменение", 12), C.dim, C.bg)
   text(bx, SUB_Y - 1, pad("Баланс", 11), C.dim, C.bg)
   if #rows == 0 then text(2, SUB_Y, "Записей пока нет.", C.dim, C.bg) end
-
-  local per = math.max(1, H - 3 - UI.oy - SUB_Y)    -- по одной строке на запись
+  local per = math.max(1, H - 3 - UI.oy - SUB_Y)
   local pages = math.max(1, math.ceil(#rows / per))
   if S.page > pages then S.page = pages end
   if S.page < 1 then S.page = 1 end
@@ -3383,8 +2828,6 @@ function UI.os.journal()
     text(bx, y, pad(e.bal and fmt(e.bal) or "-", 11), C.dim, bg)
   end
 end
-
--- намерения пополнения, которые не удалось довести до зачисления
 function UI.os.intents()
   S.backFn = function() nav({ jview = "list" }) end
   local ok, _, intents = pcall(Net.jView, S.jf or "", true)
@@ -3414,8 +2857,6 @@ function UI.os.intents()
     end })
   end
 end
-
--- правка баланса: mode "set" - установить, "add" - прибавить/убавить
 function UI.os.adjust(e, mode)
   local title = (mode == "set") and ("Новый баланс для " .. e.name .. ":")
                 or ("Изменить баланс " .. e.name .. " на (+ или -):")
@@ -3444,8 +2885,6 @@ function UI.os.adjust(e, mode)
   flash("Баланс " .. e.name .. ": " .. fmt(r.old) .. " -> " .. fmt(r.bal) .. " " .. CONFIG.CURRENCY ..
         " (записано в журнал).", true)
 end
-
--- незабранные позиции выбранного игрока: смотреть, уменьшать остаток, убирать
 function UI.os.pending()
   local name = S.pview
   S.backFn = function() nav({ pview = false, pdata = false, pforce = true }) end
@@ -3506,7 +2945,6 @@ function UI.os.pending()
     end })
   end
 end
-
 function UI.os.balances()
   if S.pview then return UI.os.pending() end
   local ok, list = pcall(Net.pView, S.pf or "", S.pforce)
@@ -3538,19 +2976,15 @@ function UI.os.balances()
       fn = function() nav({ pview = e.name, pdNeed = true, pdata = false }) end })
   end
 end
-
 local function screenCreate()
   if S.view == "edit" and screenKitEdit() then return end
   if S.view == "pick" then return screenPick() end
   S.view = "list"
   subBar()
-
   if S.csub == "journal" then
     if S.jview == "intents" then UI.os.intents() else UI.os.journal() end
-
   elseif S.csub == "balances" then
     UI.os.balances()
-
   elseif S.csub == "kits" then
     addBtn(2, 10, 28, 3, "+ Новый комплект", { bg = C.tabOn, fn = function()
       local nm = prompt("Название нового комплекта:", "", 40)
@@ -3572,7 +3006,6 @@ local function screenCreate()
                           "   Склад: " .. kitStock(k, avail) .. " шт")
       rb(y, 0, BW, "Изменить", { bg = C.tabOn, fn = function() nav({ view = "edit", kitId = k.id }) end })
     end
-
   elseif S.csub == "topup" then
     addBtn(2, 10, 28, 3, "+ Добавить ресурс", { bg = C.tabOn, fn = function() openPicker("topup", "me") end })
     addBtn(30, 10, 28, 3, "+ Из инвентаря", { bg = C.blue, fn = function() openPicker("topup", "inv") end })
@@ -3593,7 +3026,6 @@ local function screenCreate()
         render()
       end })
     end
-
   elseif S.csub == "withdraw" then
     addBtn(2, 10, 28, 3, "+ Выбрать (ME)", { bg = C.tabOn, fn = function() openPicker("withdraw", "me") end })
     addBtn(30, 10, 28, 3, "+ Из инвентаря", { bg = C.blue, fn = function() openPicker("withdraw", "inv") end })
@@ -3613,8 +3045,7 @@ local function screenCreate()
         render()
       end })
     end
-
-  else -- отзывы
+  else
     Net.fbEnsure()
     local armed = (S.confirm == "clearfb")
     addBtn(2, 10, 28, 3, armed and "Точно очистить?" or "Очистить все", { disabled = #db.feedback == 0,
@@ -3629,7 +3060,7 @@ local function screenCreate()
     local changed = false
     local reserve = BW2 * 2 + 1 + 2
     for i = first, last do
-      local idx = n - i + 1                 -- новые сверху
+      local idx = n - i + 1
       local f = db.feedback[idx]
       local y = SUB_Y + (i - first) * 4
       card(y, (f.read and "" or "* ") .. dateStr(f.time) .. "  " .. f.player, f.text,
@@ -3641,10 +3072,6 @@ local function screenCreate()
     if changed then Net.fbMarkRead() end
   end
 end
-
-----------------------------------------------------------------------
--- ОТРИСОВКА
-----------------------------------------------------------------------
 render = function()
   UI.btns = {}
   UI.oy = 0
@@ -3664,13 +3091,8 @@ render = function()
   end)
   UI.oy = 0
   if not ok then error(err, 0) end
-  UI.tag = "foot"; drawFooter(); UI.tag = nil   -- с тегом, чтобы redrawFooter не плодил дубли кнопок
+  UI.tag = "foot"; drawFooter(); UI.tag = nil
 end
-
-----------------------------------------------------------------------
--- СОБЫТИЯ
-----------------------------------------------------------------------
--- player_on приходит как (адрес PIM, ник, uuid) или (ник, uuid): адрес пропускаем
 local function parsePlayerOn(e)
   local args = {}
   for i = 2, (e.n or #e) do
@@ -3679,7 +3101,6 @@ local function parsePlayerOn(e)
   end
   return tostring(args[1] or "?"), args[2]
 end
-
 local function onPlayerOn(e)
   local name, uid = parsePlayerOn(e)
   S = { player = { name = name, uid = uid, owner = (MODE ~= "terminal") and isOwner(name, uid) or false },
@@ -3691,7 +3112,6 @@ local function onPlayerOn(e)
   gpu.setBackground(C.bg); gpu.fill(1, 1, W, H, " ")
   ctext(math.floor(H / 2), "Здравствуйте, " .. S.player.name .. "!", C.accent, C.bg)
   ctext(math.floor(H / 2) + 2, "Загружаю данные...", C.dim, C.bg)
-
   if MODE == "terminal" then
     local r = Net.login(name, uid)
     if not r then
@@ -3705,16 +3125,14 @@ local function onPlayerOn(e)
     end
     S.player.owner = r.owner
   end
-  -- незавершённые зачисления пополнений: сначала пробуем довести до конца (до чтения записи игрока)
   if MODE ~= "terminal" then pcall(Net.iSweep, name) end
   local okR, retried, gained = pcall(Net.outboxRetry, name)
   if not okR then retried, gained = 0, 0 end
   local p = getPlayer(S.player.name)
   purgePurchases(p)
-  local ok, err = scanME(S.player.name, S.player.owner)   -- единственное сканирование на входе
+  local ok, err = scanME(S.player.name, S.player.owner)
   render()
   if not ok then
-    -- технический текст ошибки видит только владелец
     flash("ME недоступна." .. (S.player.owner and (" " .. tostring(err)) or ""), false)
   elseif gained and gained > 0 then
     flash("Завершено прерванное пополнение: зачислено " .. fmt(gained) .. " " .. CONFIG.CURRENCY .. ".", true)
@@ -3724,9 +3142,6 @@ local function onPlayerOn(e)
     flash("Новых отзывов: " .. unreadFeedback() .. " (вкладка «Создание» -> «Отзывы»).", true)
   end
 end
-
--- Игрок ушёл с PIM: выгружаем всё, что нужно только на время сеанса.
--- В простое магазин держит в ОЗУ только базу; остатки ME и словари загрузятся заново при следующем входе.
 local function onPlayerOff()
   S = { player = nil }
   if MODE == "terminal" then Net.logout() end
@@ -3738,7 +3153,6 @@ local function onPlayerOff()
   gc()
   render()
 end
-
 local function onTouch(e)
   if not S.player then return end
   if e[6] and lower(e[6]) ~= lower(S.player.name) then return end
@@ -3750,12 +3164,11 @@ local function onTouch(e)
     end
   end
 end
-
 local lastAutoReport = -100
 local function reportError(err)
   err = tostring(err)
   local um = err:match("USERMSG:([^\n]*)")
-  if um then                                   -- ожидаемая проблема (сеть, чужие правки): без записи в отзывы
+  if um then
     UI.oy = 0
     if S.player then S.msg = um; S.msgOk = false; pcall(render) end
     return
@@ -3767,12 +3180,11 @@ local function reportError(err)
           math.floor(computer.totalMemory() / 1024) .. "K]"
   end)
   UI.oy = 0
-  -- лог не должен разрастаться: больше 100 КБ - начинаем заново
   local okSize, logSize = pcall(fs.size, CONFIG.LOG_PATH)
   local f = io.open(CONFIG.LOG_PATH, (okSize and (tonumber(logSize) or 0) > 102400) and "w" or "a")
   if f then
     pcall(f.write, f, tostring(os.time()) .. " " .. (err:gsub("%s*\n%s*", " | ")):sub(1, 2000) .. "\n")
-    pcall(f.close, f)                  -- закрываем всегда, даже если запись упала
+    pcall(f.close, f)
   end
   local now = computer.uptime()
   if db and now - lastAutoReport > 10 then
@@ -3787,23 +3199,14 @@ local function reportError(err)
   if S.player then
     S.msg = "Внутренняя ошибка (записана для владельца)."; S.msgOk = false
     pcall(render)
-    -- при нехватке памяти окно с ошибкой не строим: оно само требует памяти (текст всё равно в «Отзывах»)
-    if S.player.owner and not oom then   -- владельцу показываем настоящий текст
+    if S.player.owner and not oom then
       pcall(modal, "Ошибка (видно только владельцу)", err:sub(1, 600))
       pcall(render)
     end
   end
 end
-
-Net.reportError = reportError      -- сетевому слою (он объявлен раньше) нужен доступ к записи ошибок
-
-----------------------------------------------------------------------
--- ЗАПУСК
-----------------------------------------------------------------------
-local startupPrepared = false     -- подготовку базы делаем один раз за запуск, а не при каждом перезапуске main
-
--- При запуске: если после прошлой записи в «Отзывы» в error.log появилась новая ошибка, сообщаем владельцу
--- «Сервер запущен заново. Последняя ошибка: ...» (так видно перезапуск и его причину).
+Net.reportError = reportError
+local startupPrepared = false
 function Net.bootNote()
   local f = io.open(CONFIG.LOG_PATH, "r")
   if not f then return end
@@ -3821,14 +3224,9 @@ function Net.bootNote()
     text = unicode.sub("Запущено заново. Последняя ошибка (" .. dateStr(lastT) .. "): " .. tostring(lastMsg), 1, 300) }
   while #db.feedback > CONFIG.FEEDBACK_KEEP do table.remove(db.feedback, 1) end
 end
-
--- подготовка авторитетной базы (одиночный режим и сервер)
 function Net.prepareDB()
   if startupPrepared then return end
   startupPrepared = true
-  -- переводим уже сохранённые названия (комплекты, пополнение, незабранные покупки).
-  -- Записи собираем в один массив и сортируем по id предмета: файл словаря каждого мода
-  -- читается один раз (раньше они грузились по кругу из-за SHARD_KEEP) - это и тормозило запуск.
   do
     local all = {}
     local function grab(list)
@@ -3844,7 +3242,6 @@ function Net.prepareDB()
     for _, x in ipairs(all) do x.label = ruName(x.name, x.damage, x.label) end
     all = nil
   end
-  -- чистим игроков без баланса и без покупок: они только раздувают базу (создаются заново при входе)
   do
     local drop = {}
     for key, p in pairs(db.players) do
@@ -3852,8 +3249,7 @@ function Net.prepareDB()
     end
     for _, key in ipairs(drop) do db.players[key] = nil end
   end
-  Net.iSweep(nil)      -- намерения пополнения, прерванные до подтверждения: на проверку владельцу
-  -- старая база хранила журнал внутри себя: переносим записи в файл журнала (он допишется после сохранения базы)
+  Net.iSweep(nil)
   if type(db.journal) == "table" then
     local old = db.journal
     db.journal = nil
@@ -3861,10 +3257,8 @@ function Net.prepareDB()
   end
   pcall(Net.bootNote)
   pcall(saveDB)
-  ru.unload()        -- словарь нужен был только для этого перевода; дальше грузится лениво, у владельца
+  ru.unload()
 end
-
--- ПК-сервер: без экрана и киоска, только база и ответы терминалам
 function Net.serverMain()
   db = loadDB()
   Net.prepareDB()
@@ -3893,7 +3287,6 @@ function Net.serverMain()
   end
   print("KitShop SERVER остановлен.")
 end
-
 local function main()
   if MODE == "server" then return Net.serverMain() end
   if MODE == "terminal" then
@@ -3917,57 +3310,45 @@ local function main()
   end
   pcall(gpu.setResolution, CONFIG.SCREEN_W, CONFIG.SCREEN_H)
   W, H = gpu.getResolution()
-
-  -- защита киоска: Ctrl+Alt+C с клавиатуры игрока не должен останавливать программу
-  -- (оригинальные обработчики сохранены в ORIG_INT / ORIG_SOFT один раз, при загрузке файла)
   if ARGS[1] ~= "debug" then
     event.shouldInterrupt = function() return false end
     event.shouldSoftInterrupt = function() return false end
   end
-
   S = { player = nil }
   render()
-
   while running do
     local timeout = nil
     if S.player then
-      if refreshRemaining() > 0 then timeout = 1 end   -- только пока идёт кулдаун
+      if refreshRemaining() > 0 then timeout = 1 end
     else
-      timeout = 0.7                                    -- анимация заставки
+      timeout = 0.7
     end
     local e = table.pack(safePull(event.pull, timeout))
-    memGuard()                                         -- порог ОЗУ: выгрузить лишнее до обработки события
+    memGuard()
     local ok, err = xpcall(function()
       local name = e[1]
       if name == "player_on" then onPlayerOn(e)
       elseif name == "player_off" then onPlayerOff()
       elseif name == "touch" then onTouch(e)
       elseif name == nil then
-        if S.player then redrawFooter()                -- обновить таймер кнопки
-        else idleTick() end                            -- анимация заставки
+        if S.player then redrawFooter()
+        else idleTick() end
       end
       if pendingOff then pendingOff = false; onPlayerOff() end
     end, debug.traceback)
     if not ok then reportError(err) end
     if pendingOff then pendingOff = false; pcall(onPlayerOff) end
   end
-
-  -- возвращаем оригинальные обработчики; если их не было (nil), оставляем заглушку: OpenOS вызывает их без проверки
   event.shouldInterrupt = ORIG_INT or function() return false end
   event.shouldSoftInterrupt = ORIG_SOFT or function() return false end
   gpu.setBackground(0x000000); gpu.setForeground(0xFFFFFF)
   gpu.fill(1, 1, W, H, " ")
   print("KitShop остановлен.")
 end
-
-----------------------------------------------------------------------
--- АВТОЗАПУСК: строка в /home/.shrc (OpenOS выполняет её при каждой загрузке)
-----------------------------------------------------------------------
-do   -- служебные команды и запуск: в отдельном блоке, чтобы не упереться в лимит 200 локальных переменных Lua
+do
 local RC_PATH   = "/home/.shrc"
 local RC_MARK   = "# kitshop-autostart"
-local NOAUTO    = "/home/kitshop/noautostart"      -- флаг: владелец отключил автозапуск
-
+local NOAUTO    = "/home/kitshop/noautostart"
 local function selfPath()
   local src = tostring(SELF_SRC or ""):gsub("^[@=]", "")
   if src == "" then return nil end
@@ -3977,7 +3358,6 @@ local function selfPath()
   end
   return fs.canonical(src)
 end
-
 local function readRc()
   local lines = {}
   local f = io.open(RC_PATH, "r")
@@ -3987,7 +3367,6 @@ local function readRc()
   end
   return lines
 end
-
 local function writeRc(lines)
   local f = io.open(RC_PATH, "w")
   if not f then return false end
@@ -3996,14 +3375,12 @@ local function writeRc(lines)
   f:close()
   return true
 end
-
--- включает/выключает автозапуск; возвращает (ok, текст)
 local function setAutostart(on, path)
   path = path or selfPath()
   local lines, out = readRc(), {}
   local skip = false
   for _, l in ipairs(lines) do
-    if l:find(RC_MARK, 1, true) then skip = true          -- строка-метка и следующая за ней (команда)
+    if l:find(RC_MARK, 1, true) then skip = true
     elseif skip then skip = false
     else out[#out + 1] = l end
   end
@@ -4020,22 +3397,17 @@ local function setAutostart(on, path)
   if not writeRc(out) then return false, "Не удалось записать " .. RC_PATH end
   return true, on and ("Автозапуск включён: " .. path) or "Автозапуск выключен."
 end
-
 local function autostartEnabled()
   for _, l in ipairs(readRc()) do
     if l:find(RC_MARK, 1, true) then return true end
   end
   return false
 end
-
--- при обычном запуске сам настраивает автозапуск (если его не отключали командой autostart off)
 local function ensureAutostart()
   if fs.exists(NOAUTO) or autostartEnabled() then return end
   local path = selfPath()
   if path and fs.exists(path) then pcall(setAutostart, true, path) end
 end
-
--- команда: lua shop.lua autostart on|off|status [путь]
 local function autostartCli()
   local cmd = ARGS[2]
   if cmd == "on" then
@@ -4052,8 +3424,6 @@ local function autostartCli()
     print("Использование: lua shop.lua autostart on|off|status [путь]")
   end
 end
-
--- команда: lua kitshop.lua owner add|del|list [Ник]
 local function ownerCli()
   local cmd, nick = ARGS[2], ARGS[3]
   if MODE == "terminal" then
@@ -4061,7 +3431,6 @@ local function ownerCli()
     return
   end
   if MODE == "server" and (cmd == "add" or cmd == "del") and nick then
-    -- сервер запущен и держит базу в памяти: команду кладём в очередь, он применит её сам
     pcall(fs.makeDirectory, fs.path(CONFIG.CMD_PATH))
     local f = io.open(CONFIG.CMD_PATH, "a")
     if f then f:write(cmd .. "\t" .. nick .. "\n"); f:close() end
@@ -4077,7 +3446,7 @@ local function ownerCli()
       if lower(db.owners[i]) == lower(nick) then table.remove(db.owners, i) end
     end
     db.ownerUids = db.ownerUids or {}
-    db.ownerUids[lower(nick)] = nil          -- сброс привязки к UUID
+    db.ownerUids[lower(nick)] = nil
     saveDB(); print("Удалён из владельцев: " .. nick)
   elseif cmd == "list" then
     for _, o in ipairs(CONFIG.OWNERS) do print(o .. "  (из файла)") end
@@ -4086,9 +3455,6 @@ local function ownerCli()
     print("Использование: lua kitshop.lua owner add|del|list [Ник]")
   end
 end
-
--- диагностика: lua kitshop.lua dump [часть названия]
--- печатает все поля первых 10 подходящих предметов из ME (чтобы найти поле NBT/хеша)
 local function dumpCli()
   local f = lower(ARGS[2] or "")
   local list = me.getItemsInNetwork()
@@ -4115,9 +3481,6 @@ local function dumpCli()
   end
   if shown == 0 then print("Ничего не найдено.") end
 end
-
--- Надзиратель: при любой неожиданной ошибке магазин перезапускается,
--- а не падает в консоль (к которой мог бы получить доступ игрок).
 local function supervised()
   local fails = 0
   while running do
@@ -4128,8 +3491,6 @@ local function supervised()
       fails = fails + 1
       pcall(reportError, err)
       if fails >= 5 then
-        -- 5 падений подряд: перезапуск main не помогает. Полная перезагрузка ПК освобождает
-        -- всю память, а автозапуск (.shrc) поднимет магазин заново. В консоль не выходим.
         pcall(computer.shutdown, true)
         os.sleep(5)
         return
@@ -4139,13 +3500,9 @@ local function supervised()
     end
   end
 end
-
--- диагностика перевода: lua kitshop.lua missing
--- показывает предметы ME, для которых нет русского названия в словаре, и пишет полный список
--- в /home/kitshop/missing.txt (id&&damage<TAB>label<TAB>причина)
 local function missingCli()
   local list = me.getItemsInNetwork()
-  table.sort(list, function(a, b) return tostring(a.name) < tostring(b.name) end)   -- моды подряд
+  table.sort(list, function(a, b) return tostring(a.name) < tostring(b.name) end)
   local seen, rows = {}, {}
   local total, translated = 0, 0
   for _, it in ipairs(list) do
@@ -4180,8 +3537,6 @@ local function missingCli()
   for i = 1, math.min(25, #rows) do print("  " .. rows[i].k .. "  |  " .. rows[i].label .. "  |  " .. rows[i].why) end
   print("Полный список: /home/kitshop/missing.txt")
 end
-
--- проверка связи с сервером: lua shop.lua ping (на терминале)
 local function pingCli()
   if MODE ~= "terminal" then print("ping выполняется на терминале (CONFIG.MODE = \"terminal\")."); return end
   local wl = false
@@ -4200,8 +3555,6 @@ local function pingCli()
     print(" 4) если сервер пишет «неверный NET_KEY» - ключи различаются.")
   end
 end
-
--- диагностика: lua shop.lua methods - список методов ME Interface и пример getAvailableItems
 local function methodsCli()
   local ok, m = pcall(component.methods, me.address)
   local names = {}
@@ -4225,8 +3578,6 @@ local function methodsCli()
     else print("getAvailableItems: ошибка " .. tostring(list)) end
   else print("getAvailableItems нет") end
 end
-
--- диагностика: lua shop.lua kits - что реально сохранено в комплектах (id, damage, var/хеш)
 local function kitsCli()
   if MODE == "terminal" then print("Команда kits выполняется на сервере (или в одиночном режиме)."); return end
   db = loadDB()
@@ -4238,8 +3589,6 @@ local function kitsCli()
     end
   end
 end
-
--- диагностика: lua shop.lua fp [часть id] - все поля предмета в getAvailableItems и getItemsInNetwork
 local function fpCli()
   local f = lower(ARGS[2] or "tank")
   local function flat(t)
@@ -4272,7 +3621,6 @@ local function fpCli()
     end
   end
 end
-
 if ARGS[1] == "ping" then pingCli()
 elseif ARGS[1] == "fp" and me then fpCli()
 elseif ARGS[1] == "kits" then kitsCli()
@@ -4281,7 +3629,7 @@ elseif ARGS[1] == "owner" then ownerCli()
 elseif ARGS[1] == "autostart" then autostartCli()
 elseif ARGS[1] == "missing" then missingCli()
 elseif ARGS[1] == "dump" then dumpCli()
-elseif ARGS[1] == "debug" then            -- без автоперезапуска, Ctrl+Alt+C работает
+elseif ARGS[1] == "debug" then
   local ok, err = xpcall(main, debug.traceback)
   if not ok then print(err) end
 else
