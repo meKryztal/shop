@@ -1195,7 +1195,7 @@ function Net.outboxRetry(who)
   return n, round2(mine)
 end
 end
-local cache = { items = {}, byKey = {}, time = nil, scanned = nil, pickMore = false, pickTotal = 0 }
+local cache = { items = {}, byKey = {}, time = nil, pickMore = false, pickTotal = 0 }
 local function wantedNames(who, full)
   local w = {}
   for _, k in ipairs(db.kits) do for _, it in ipairs(k.items) do w[it.name] = true end end
@@ -1235,8 +1235,41 @@ local function migrateVariants(by)
   end
   if changed then saveDB() end
 end
-local detailCache, detailCount, DETAIL_MAX = {}, 0, 200
-memReleasers[#memReleasers + 1] = function() detailCache, detailCount = {}, 0 end
+local detailCache, detailCount, DETAIL_MAX = {}, 0, 1000
+cache.DPATH = "/home/kitshop/detail_cache.dat"
+function cache.detailLoad()
+  cache.dl = true
+  local f = io.open(cache.DPATH, "rb")
+  if not f then return end
+  local ok, data = pcall(f.read, f, "*a")
+  pcall(f.close, f)
+  if not ok or not data then return end
+  local ok2, t = pcall(ser.unserialize, data)
+  if ok2 and type(t) == "table" then
+    for h, d in pairs(t) do
+      if detailCache[h] == nil then detailCache[h] = d; detailCount = detailCount + 1 end
+    end
+  end
+end
+function cache.detailSave()
+  cache.dd = false
+  local keep = {}
+  for h, d in pairs(detailCache) do
+    if d then keep[h] = d end
+  end
+  pcall(fs.makeDirectory, fs.path(cache.DPATH))
+  local ok, data = pcall(ser.serialize, keep)
+  if not ok then return end
+  local tmp = cache.DPATH .. ".tmp"
+  local f = io.open(tmp, "wb")
+  if not f then return end
+  pcall(f.write, f, data)
+  pcall(f.close, f)
+  pcall(fs.remove, cache.DPATH)
+  pcall(fs.rename, tmp, cache.DPATH)
+end
+cache.detailLoad()
+memReleasers[#memReleasers + 1] = function() detailCache, detailCount = {}, 0; cache.dl = false end
 local function shallow(t)
   if type(t) ~= "table" then return nil end
   local r = {}
@@ -1263,6 +1296,7 @@ local function taggedFromRaw(match)
 end
 local function mergeTagged(base, tagged)
   if not tagged or #tagged == 0 then return base end
+  if not cache.dl then cache.detailLoad() end
   local out = {}
   for _, it in ipairs(base) do
     if type(it) == "table" and not it.hasTag then out[#out + 1] = it end
@@ -1286,9 +1320,11 @@ local function mergeTagged(base, tagged)
         d = { label = det.display_name or det.label, fluid_container = fc,
               maxSize = tonumber(det.max_size or det.maxSize) }
       end
-      if detailCount >= DETAIL_MAX then detailCache, detailCount = {}, 0 end
-      detailCache[f.nbt_hash] = d
-      detailCount = detailCount + 1
+      if detailCount < DETAIL_MAX then
+        detailCache[f.nbt_hash] = d
+        detailCount = detailCount + 1
+        if d then cache.dd = true end
+      end
     end
     if d then
       it.label = d.label or it.label
@@ -1297,6 +1333,7 @@ local function mergeTagged(base, tagged)
     end
     out[#out + 1] = it
   end
+  if cache.dd then cache.detailSave() end
   return out
 end
 local function meList(fname, fdmg)
@@ -1329,20 +1366,25 @@ local function scanME(who, full)
     for n in pairs(want) do names[#names + 1] = n end
     local list, anyTag = {}, false
     if #names > 0 then
-      memGuard()
-      local okL, base = pcall(me.getItemsInNetwork)
-      if not okL or type(base) ~= "table" then error("ME вернула " .. tostring(base)) end
-      for i = 1, #base do
-        local it = base[i]
-        base[i] = false
-        if type(it) == "table" and want[it.name] then
-          if it.hasTag then anyTag = true end
-          list[#list + 1] = it
+      if #names <= 200 then
+        for _, n in ipairs(names) do
+          local ok, part = pcall(me.getItemsInNetwork, { name = n })
+          if not ok then error("ME вернула " .. tostring(part)) end
+          if type(part) ~= "table" then error("ME вернула " .. tostring(part)) end
+          memGuard()
+          for _, it in ipairs(part) do
+            if type(it) == "table" then
+              if it.hasTag then anyTag = true end
+              list[#list + 1] = it
+            end
+          end
         end
-      end
-      base = nil
-      if anyTag and me.getAvailableItems ~= nil then
-        list = mergeTagged(list, taggedFromRaw(function(f) return want[f.id] end))
+        if anyTag and me.getAvailableItems ~= nil then
+          list = mergeTagged(list, taggedFromRaw(function(f) return want[f.id] end))
+        end
+      else
+        list = meList()
+        if type(list) ~= "table" then error("ME вернула " .. tostring(list)) end
       end
     end
     local by = {}
@@ -1364,7 +1406,6 @@ local function scanME(who, full)
     list = nil
     migrateVariants(by)
     cache.byKey, cache.time = by, computer.uptime()
-    cache.scanned = want
     gc()
   end)
 end
@@ -2114,7 +2155,7 @@ local function doRefresh()
   if refreshRemaining() > 0 then return end
   if MODE == "terminal" then pcall(Net.pullConfig) end
   status("Сканирую ME-сеть...")
-  local ok, err = scanME(nil, true)
+  local ok, err = scanME(S.player and S.player.name, S.player and S.player.owner)
   if ok and S.player and S.player.owner and S.view == "pick" then
     if S.pickSource == "inv" then ok, err = invPickerScan(S.filter)
     else ok, err = pickerScan(S.filter) end
@@ -2285,6 +2326,8 @@ local function paged(count, y0)
   local first = (S.page - 1) * per + 1
   return first, math.min(count, first + per - 1)
 end
+local drawIdle, idleTick
+do
 local SPL_BAND = 5
 local SPL_BOX_W, SPL_BOX_H = 40, 5
 local SPL_GLYPH = {
@@ -2408,7 +2451,7 @@ local function drawSplashPrompt(g, bright)
   gpu.setForeground(bright and 0x68f029 or 0x3a7d1e)
   gpu.set(g.boxX + math.floor((SPL_BOX_W - unicode.len(s)) / 2), g.boxY + math.floor(SPL_BOX_H / 2), s)
 end
-local function drawIdle()
+function drawIdle()
   UI.oy = 0
   local g = splashGeom()
   for i = 0, math.ceil(H / SPL_BAND) - 1 do
@@ -2421,12 +2464,13 @@ local function drawIdle()
   drawSplashFrame()
   drawTitle(g)
 end
-local function idleTick()
+function idleTick()
   if S.player then return end
   UI.oy = 0
   splashStep = splashStep + 1
   drawStars(true)
   drawSplashPrompt(splashGeom(), splashStep % 2 == 0)
+end
 end
 local function switchTab(t)
   S.tab = t; S.view = "list"; S.csub = "kits"; S.page = 1; S.pview = false
@@ -3097,13 +3141,6 @@ local function parsePlayerOn(e)
   end
   return tostring(args[1] or "?"), args[2]
 end
-function cache.covers(who, full)
-  if not cache.time or not cache.scanned then return false end
-  for n in pairs(wantedNames(who, full)) do
-    if not cache.scanned[n] then return false end
-  end
-  return true
-end
 local function onPlayerOn(e)
   local name, uid = parsePlayerOn(e)
   S = { player = { name = name, uid = uid, owner = (MODE ~= "terminal") and isOwner(name, uid) or false },
@@ -3133,10 +3170,7 @@ local function onPlayerOn(e)
   if not okR then retried, gained = 0, 0 end
   local p = getPlayer(S.player.name)
   purgePurchases(p)
-  local ok, err = true, nil
-  if not cache.covers(S.player.name, true) or (refreshRemaining() == 0 and computer.uptime() - cache.time > 120) then
-    ok, err = scanME(nil, true)
-  end
+  local ok, err = scanME(S.player.name, S.player.owner)
   render()
   if not ok then
     flash("ME недоступна." .. (S.player.owner and (" " .. tostring(err)) or ""), false)
@@ -3151,8 +3185,9 @@ end
 local function onPlayerOff()
   S = { player = nil }
   if MODE == "terminal" then Net.logout() end
-  cache.items = {}
+  cache.items, cache.byKey, cache.time = {}, {}, nil
   cache.pickMore, cache.pickTotal = false, 0
+  fpCache, fpCount = {}, 0
   ru.unload()
   gc()
   render()
@@ -3320,7 +3355,6 @@ local function main()
   end
   S = { player = nil }
   render()
-  local idleScanTry = -1e9
   while running do
     local timeout = nil
     if S.player then
@@ -3337,14 +3371,7 @@ local function main()
       elseif name == "touch" then onTouch(e)
       elseif name == nil then
         if S.player then redrawFooter()
-        else
-          idleTick()
-          local now = computer.uptime()
-          if (not cache.time or now - cache.time > 120) and now - idleScanTry > 30 then
-            idleScanTry = now
-            pcall(scanME, nil, true)
-          end
-        end
+        else idleTick() end
       end
       if pendingOff then pendingOff = false; onPlayerOff() end
     end, debug.traceback)
