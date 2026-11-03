@@ -224,25 +224,36 @@ local function defaultDB()
            nextJid = 1, intents = {}, nextIntentId = 1 }
 end
 local function loadDB()
+  local existed, lastErr = false, nil
   for _, path in ipairs({ CONFIG.DB_PATH, CONFIG.DB_PATH .. ".tmp" }) do
     if fs.exists(path) then
-      local f = io.open(path, "r")
-      if f then
-        local okR, data = pcall(f.read, f, "*a")
-        pcall(f.close, f)
-        local t
-        if okR and data then
-          local okU, res = pcall(ser.unserialize, data)
-          if okU then t = res end
+      existed = true
+      for attempt = 1, 2 do
+        local f = io.open(path, "r")
+        if f then
+          local okR, data = pcall(f.read, f, "*a")
+          pcall(f.close, f)
+          local t
+          if okR and data then
+            local okU, res = pcall(ser.unserialize, data)
+            if okU then t = res else lastErr = tostring(res) end
+          else
+            lastErr = tostring(data)
+          end
+          data = nil
+          if type(t) == "table" then
+            for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
+            return t
+          end
         end
-        data = nil
-        if type(t) == "table" then
-          for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
-          return t
-        end
-        pcall(fs.copy, path, path .. ".bad")
+        gc()
       end
+      pcall(fs.copy, path, path .. ".bad")
     end
+  end
+  if existed then
+    error("Не удалось прочитать базу " .. CONFIG.DB_PATH .. " (" .. tostring(lastErr) ..
+          "). Файл сохранён как .bad. Запуск остановлен, чтобы не затереть данные.", 0)
   end
   return defaultDB()
 end
