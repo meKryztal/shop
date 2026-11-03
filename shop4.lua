@@ -2347,6 +2347,8 @@ local function paged(count, y0)
 	local first = (S.page - 1) * per + 1
 	return first, math.min(count, first + per - 1)
 end
+local drawIdle, idleTick
+do
 local SPL_BAND = 5
 local SPL_BOX_W, SPL_BOX_H = 40, 5
 local SPL_GLYPH = {
@@ -2470,7 +2472,7 @@ local function drawSplashPrompt(g, bright)
 	gpu.setForeground(bright and 0x68f029 or 0x3a7d1e)
 	gpu.set(g.boxX + math.floor((SPL_BOX_W - unicode.len(s)) / 2), g.boxY + math.floor(SPL_BOX_H / 2), s)
 end
-local function drawIdle()
+function drawIdle()
 	UI.oy = 0
 	local g = splashGeom()
 	for i = 0, math.ceil(H / SPL_BAND) - 1 do
@@ -2483,12 +2485,13 @@ local function drawIdle()
 	drawSplashFrame()
 	drawTitle(g)
 end
-local function idleTick()
+function idleTick()
 	if S.player then return end
 	UI.oy = 0
 	splashStep = splashStep + 1
 	drawStars(true)
 	drawSplashPrompt(splashGeom(), splashStep % 2 == 0)
+end
 end
 local function switchTab(t)
 	S.tab = t; S.view = "list"; S.csub = "kits"; S.page = 1; S.pview = false
