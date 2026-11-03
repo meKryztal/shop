@@ -224,36 +224,25 @@ local function defaultDB()
            nextJid = 1, intents = {}, nextIntentId = 1 }
 end
 local function loadDB()
-  local existed, lastErr = false, nil
   for _, path in ipairs({ CONFIG.DB_PATH, CONFIG.DB_PATH .. ".tmp" }) do
     if fs.exists(path) then
-      existed = true
-      for attempt = 1, 2 do
-        local f = io.open(path, "r")
-        if f then
-          local okR, data = pcall(f.read, f, "*a")
-          pcall(f.close, f)
-          local t
-          if okR and data then
-            local okU, res = pcall(ser.unserialize, data)
-            if okU then t = res else lastErr = tostring(res) end
-          else
-            lastErr = tostring(data)
-          end
-          data = nil
-          if type(t) == "table" then
-            for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
-            return t
-          end
+      local f = io.open(path, "r")
+      if f then
+        local okR, data = pcall(f.read, f, "*a")
+        pcall(f.close, f)
+        local t
+        if okR and data then
+          local okU, res = pcall(ser.unserialize, data)
+          if okU then t = res end
         end
-        gc()
+        data = nil
+        if type(t) == "table" then
+          for k, v in pairs(defaultDB()) do if t[k] == nil then t[k] = v end end
+          return t
+        end
+        pcall(fs.copy, path, path .. ".bad")
       end
-      pcall(fs.copy, path, path .. ".bad")
     end
-  end
-  if existed then
-    error("Не удалось прочитать базу " .. CONFIG.DB_PATH .. " (" .. tostring(lastErr) ..
-          "). Файл сохранён как .bad. Запуск остановлен, чтобы не затереть данные.", 0)
   end
   return defaultDB()
 end
@@ -1264,12 +1253,8 @@ function cache.detailLoad()
 end
 function cache.detailSave()
   cache.dd = false
-  local keep = {}
-  for h, d in pairs(detailCache) do
-    if d then keep[h] = d end
-  end
   pcall(fs.makeDirectory, fs.path(cache.DPATH))
-  local ok, data = pcall(ser.serialize, keep)
+  local ok, data = pcall(ser.serialize, detailCache)
   if not ok then return end
   local tmp = cache.DPATH .. ".tmp"
   local f = io.open(tmp, "wb")
@@ -1305,7 +1290,7 @@ local function taggedFromRaw(match)
   gc()
   return t
 end
-local function mergeTagged(base, tagged)
+local function mergeTagged(base, tagged, wantFilter)
   if not tagged or #tagged == 0 then return base end
   if not cache.dl then cache.detailLoad() end
   local out = {}
@@ -1314,35 +1299,38 @@ local function mergeTagged(base, tagged)
   end
   for _, e in ipairs(tagged) do
     local f = e.fp
-    local it = { name = f.id, damage = f.dmg, size = e.qty,
-                 nbt_hash = f.nbt_hash, label = f.id, maxSize = 64 }
-    local d = detailCache[f.nbt_hash]
-    if d == nil then
-      local ok3, det = pcall(me.getItemDetail, f)
-      if ok3 and type(det) == "table" and det.all ~= nil then
-        local ok4, all = pcall(det.all); if ok4 then det = all end
-      end
-      d = false
-      if ok3 and type(det) == "table" then
-        local fc = shallow(det.fluid_container)
-        if fc and type(det.fluid_container.contents) == "table" then
-          fc.contents = shallow(det.fluid_container.contents)
+    if wantFilter and not wantFilter[f.id] then
+    else
+      local it = { name = f.id, damage = f.dmg, size = e.qty,
+                   nbt_hash = f.nbt_hash, label = f.id, maxSize = 64 }
+      local d = detailCache[f.nbt_hash]
+      if d == nil then
+        local ok3, det = pcall(me.getItemDetail, f)
+        if ok3 and type(det) == "table" and det.all ~= nil then
+          local ok4, all = pcall(det.all); if ok4 then det = all end
         end
-        d = { label = det.display_name or det.label, fluid_container = fc,
-              maxSize = tonumber(det.max_size or det.maxSize) }
+        d = false
+        if ok3 and type(det) == "table" then
+          local fc = shallow(det.fluid_container)
+          if fc and type(det.fluid_container.contents) == "table" then
+            fc.contents = shallow(det.fluid_container.contents)
+          end
+          d = { label = det.display_name or det.label, fluid_container = fc,
+                maxSize = tonumber(det.max_size or det.maxSize) }
+        end
+        if detailCount < DETAIL_MAX then
+          detailCache[f.nbt_hash] = d
+          detailCount = detailCount + 1
+          cache.dd = true
+        end
       end
-      if detailCount < DETAIL_MAX then
-        detailCache[f.nbt_hash] = d
-        detailCount = detailCount + 1
-        if d then cache.dd = true end
+      if d then
+        it.label = d.label or it.label
+        it.fluid_container = d.fluid_container
+        it.maxSize = d.maxSize or 64
       end
+      out[#out + 1] = it
     end
-    if d then
-      it.label = d.label or it.label
-      it.fluid_container = d.fluid_container
-      it.maxSize = d.maxSize or 64
-    end
-    out[#out + 1] = it
   end
   if cache.dd then cache.detailSave() end
   return out
@@ -1391,7 +1379,7 @@ local function scanME(who, full)
           end
         end
         if anyTag and me.getAvailableItems ~= nil then
-          list = mergeTagged(list, taggedFromRaw(function(f) return want[f.id] end))
+          list = mergeTagged(list, taggedFromRaw(function(f) return want[f.id] end), want)
         end
       else
         list = meList()
@@ -2337,8 +2325,6 @@ local function paged(count, y0)
   local first = (S.page - 1) * per + 1
   return first, math.min(count, first + per - 1)
 end
-local drawIdle, idleTick
-do
 local SPL_BAND = 5
 local SPL_BOX_W, SPL_BOX_H = 40, 5
 local SPL_GLYPH = {
@@ -2462,7 +2448,7 @@ local function drawSplashPrompt(g, bright)
   gpu.setForeground(bright and 0x68f029 or 0x3a7d1e)
   gpu.set(g.boxX + math.floor((SPL_BOX_W - unicode.len(s)) / 2), g.boxY + math.floor(SPL_BOX_H / 2), s)
 end
-function drawIdle()
+local function drawIdle()
   UI.oy = 0
   local g = splashGeom()
   for i = 0, math.ceil(H / SPL_BAND) - 1 do
@@ -2475,13 +2461,12 @@ function drawIdle()
   drawSplashFrame()
   drawTitle(g)
 end
-function idleTick()
+local function idleTick()
   if S.player then return end
   UI.oy = 0
   splashStep = splashStep + 1
   drawStars(true)
   drawSplashPrompt(splashGeom(), splashStep % 2 == 0)
-end
 end
 local function switchTab(t)
   S.tab = t; S.view = "list"; S.csub = "kits"; S.page = 1; S.pview = false
