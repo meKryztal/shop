@@ -83,7 +83,7 @@ do
 		return {}
 	end
 	local function modFile(name)
-		local mod = tostring(name):match("^([^:]+):") or ""
+		local mod = tostring(name):match("^([^:]+):") or "_"
 		return (mod:gsub("[^%w_%-]", "_"))
 	end
 	local function shardFor(name)
@@ -1235,46 +1235,37 @@ local function migrateVariants(by)
 	end
 	if changed then saveDB() end
 end
-local detailCache, detailCount, DETAIL_MAX = {}, 0, 200
-local DETAIL_CACHE_PATH = "/home/kitshop/detail_cache.dat"
-local DETAIL_CACHE_MAX_FILE = 2000
-local function loadDetailCache()
-	if fs.exists(DETAIL_CACHE_PATH) then
-		local f = io.open(DETAIL_CACHE_PATH, "r")
-		if f then
-			local ok, data = pcall(f.read, f, "*a")
-			pcall(f.close, f)
-			if ok and data then
-				local ok2, t = pcall(ser.unserialize, data)
-				if ok2 and type(t) == "table" then
-					detailCache = t
-					local n = 0
-					for _ in pairs(t) do n = n + 1 end
-					detailCount = n
-					return
-				end
-			end
+local detailCache, detailCount, DETAIL_MAX = {}, 0, 1000
+cache.DPATH = "/home/kitshop/detail_cache.dat"
+function cache.detailLoad()
+	cache.dl = true
+	local f = io.open(cache.DPATH, "rb")
+	if not f then return end
+	local ok, data = pcall(f.read, f, "*a")
+	pcall(f.close, f)
+	if not ok or not data then return end
+	local ok2, t = pcall(ser.unserialize, data)
+	if ok2 and type(t) == "table" then
+		for h, d in pairs(t) do
+			if detailCache[h] == nil then detailCache[h] = d; detailCount = detailCount + 1 end
 		end
 	end
 end
-local function saveDetailCache()
-	if detailCount == 0 then return end
-	pcall(fs.makeDirectory, fs.path(DETAIL_CACHE_PATH))
-	local f = io.open(DETAIL_CACHE_PATH, "w")
+function cache.detailSave()
+	cache.dd = false
+	pcall(fs.makeDirectory, fs.path(cache.DPATH))
+	local ok, data = pcall(ser.serialize, detailCache)
+	if not ok then return end
+	local tmp = cache.DPATH .. ".tmp"
+	local f = io.open(tmp, "wb")
 	if not f then return end
-	local saved = 0
-	local trimmed = {}
-	for k, v in pairs(detailCache) do
-		if saved >= DETAIL_CACHE_MAX_FILE then break end
-		trimmed[k] = v
-		saved = saved + 1
-	end
-	local ok, data = pcall(ser.serialize, trimmed)
-	if ok then pcall(f.write, f, data) end
+	pcall(f.write, f, data)
 	pcall(f.close, f)
+	pcall(fs.remove, cache.DPATH)
+	pcall(fs.rename, tmp, cache.DPATH)
 end
-loadDetailCache()
-memReleasers[#memReleasers + 1] = function() saveDetailCache() end
+cache.detailLoad()
+memReleasers[#memReleasers + 1] = function() detailCache, detailCount = {}, 0; cache.dl = false end
 local function shallow(t)
 	if type(t) ~= "table" then return nil end
 	local r = {}
@@ -1299,6 +1290,7 @@ local function taggedFromRaw(match)
 end
 local function mergeTagged(base, tagged, wantFilter)
 	if not tagged or #tagged == 0 then return base end
+	if not cache.dl then cache.detailLoad() end
 	local out = {}
 	for _, it in ipairs(base) do
 		if type(it) == "table" and not it.hasTag then out[#out + 1] = it end
@@ -1325,9 +1317,11 @@ local function mergeTagged(base, tagged, wantFilter)
 						fluid_container = fc,
 						maxSize = tonumber(det.max_size or det.maxSize) }
 				end
-				if detailCount >= DETAIL_MAX then detailCache, detailCount = {}, 0 end
-				detailCache[f.nbt_hash] = d
-				detailCount = detailCount + 1
+				if detailCount < DETAIL_MAX then
+					detailCache[f.nbt_hash] = d
+					detailCount = detailCount + 1
+					cache.dd = true
+				end
 			end
 			if d then
 				it.label = d.label or it.label
@@ -1337,6 +1331,7 @@ local function mergeTagged(base, tagged, wantFilter)
 			out[#out + 1] = it
 		end
 	end
+	if cache.dd then cache.detailSave() end
 	return out
 end
 local function meList(fname, fdmg)
@@ -1436,7 +1431,7 @@ local function scanME(who, full)
 	end)
 end
 local function searchNorm(s)
-	return (lower(s):gsub("[:%-%.]", " "))
+	return (lower(s):gsub("[_:%-%.]", " "))
 end
 local function pickerScan(filter)
 	cache.items = {}
@@ -1809,7 +1804,7 @@ local function prompt(title, initial, maxLen)
 		fill(bx + 3, by + 3, bw - 6, 1, 0x000000)
 		local shown, room = buf, bw - 8
 		if unicode.len(shown) > room then shown = unicode.sub(shown, unicode.len(shown) - room + 1) end
-		text(bx + 3, by + 3, shown .. " ", C.accent, 0x000000)
+		text(bx + 3, by + 3, shown .. "_", C.accent, 0x000000)
 		text(bx + 2, by + 5, pad("Enter - принять, × - отмена", bw - 4), C.dim, C.dlg)
 	end
 	draw()
@@ -1976,7 +1971,7 @@ local function doClaim(pu, it, quiet)
 	local function out(msg, ok)
 		if quiet then S.msg = msg; S.msgOk = (ok ~= false) else flash(msg, ok) end
 	end
-	local shown = tostring(it.label):gsub("%s#[%w%-]+", ""):gsub("%s%(%s*%)", "")
+	local shown = tostring(it.label):gsub("%s*#[%w_%-]+", ""):gsub("%s*%(%s*%)", "")
 	if it.qty <= 0 then return "ok" end
 	local key = itemKey(it.name, it.damage, it.var)
 	local maxSize = (cache.byKey[key] and cache.byKey[key].maxSize) or 64
@@ -2251,7 +2246,7 @@ local function withdrawDialog()
 		fill(bx + 3, by + 6, fw - 2, 1, 0x000000)
 		local shown = buf
 		if unicode.len(shown) > fw - 4 then shown = unicode.sub(shown, unicode.len(shown) - fw + 5) end
-		text(bx + 3, by + 6, shown .. " ", C.accent, 0x000000)
+		text(bx + 3, by + 6, shown .. "_", C.accent, 0x000000)
 		fill(bx + bw - 2 - mw, by + 5, mw, 3, C.blue)
 		text(bx + bw - 2 - mw + math.floor((mw - 3) / 2), by + 6, "MAX", 0xffffff, C.blue)
 		if err then text(bx + 2, by + 8, pad(err, bw - 4), C.red, C.dlg)
