@@ -2537,10 +2537,19 @@ end
 local function screenPurchase(p)
   local pu = findPurchase(p, S.purchaseId)
   if not pu then S.view = "mine"; return false end
-  text(2, 6, pad("Покупка #" .. pu.id .. ": " .. pu.kit, W - 36), C.accent, C.bg)
-  text(2, 8, pad("Забирайте по одному или кнопкой «Забрать всё».", W - 36), C.dim, C.bg)
+  local again
+  for _, k in ipairs(db.kits) do
+    if k.name == pu.kit and #k.items > 0 then again = k; break end
+  end
+  local tw = again and (W - 68) or (W - 36)
+  text(2, 6, pad("Покупка #" .. pu.id .. ": " .. pu.kit, tw), C.accent, C.bg)
+  text(2, 8, pad("Забирайте по одному или кнопкой «Забрать всё».", tw), C.dim, C.bg)
   addBtn(W - 33, 6, 30, 3, "Забрать всё", { disabled = purchasePending(pu) == 0, bg = C.tabOn,
     fn = function() claimAll(pu) end })
+  if again then
+    addBtn(W - 65, 6, 30, 3, "Купить ещё за " .. fmt(again.price), { bg = C.green,
+      fn = function() doBuy(again) end })
+  end
   local first, last = paged(#pu.items, LIST_Y)
   for i = first, last do
     local it = pu.items[i]
