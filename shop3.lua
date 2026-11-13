@@ -2547,7 +2547,7 @@ local function screenPurchase(p)
   addBtn(W - 33, 6, 30, 3, "Забрать всё", { disabled = purchasePending(pu) == 0, bg = C.tabOn,
     fn = function() claimAll(pu) end })
   if again then
-    addBtn(W - 65, 6, 30, 3, "Купить ещё за " .. fmt(again.price), { bg = C.green,
+    addBtn(W - 65, 6, 30, 3, "Купить ещё за " .. fmt(again.price), { disabled = purchasePending(pu) > 0, bg = C.green,
       fn = function() doBuy(again) end })
   end
   local first, last = paged(#pu.items, LIST_Y)
