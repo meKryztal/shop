@@ -1697,7 +1697,7 @@ local function card(y, title, sub, subColor, reserve)
 end
 local KIT_GAP = 10
 local PENCIL_W = 3
-local function lineCard(y, title, info, infoColor, reserve, onEdit)
+local function lineCard(y, title, info, infoColor, reserve, onEdit, titleColor)
   reserve = reserve or (BW + 2)
   fill(2, y, W - 2, 3, C.panel)
   local x0 = 3
@@ -1717,7 +1717,7 @@ local function lineCard(y, title, info, infoColor, reserve, onEdit)
   end
   if unicode.len(title) > room then title = unicode.sub(title, 1, room) end
   local lt = unicode.len(title)
-  text(x0, y + 1, title, C.accent, C.panel)
+  text(x0, y + 1, title, titleColor or C.accent, C.panel)
   text(x0 + lt + KIT_GAP, y + 1, info, infoColor or C.text, C.panel)
 end
 local S = { player = nil }
@@ -1825,6 +1825,68 @@ local function askPrice(title, initial)
     return nil
   end
   return v
+end
+UI.KIT_COLORS = {
+  { "Зелёный", 0x68f029 }, { "Белый", 0xffffff }, { "Жёлтый", 0xffe033 }, { "Золотой", 0xf2b233 },
+  { "Оранжевый", 0xff8c1a }, { "Красный", 0xff5555 }, { "Розовый", 0xff77cc }, { "Фиолетовый", 0xb066ff },
+  { "Синий", 0x5599ff }, { "Голубой", 0x33ddee }, { "Бирюзовый", 0x33ddaa }, { "Серый", 0xaaaaaa },
+}
+function UI.kitColor(k, fb)
+  local c = type(k) == "table" and tonumber(k.color) or nil
+  if c and c >= 0 and c <= 0xFFFFFF then return math.floor(c) end
+  return fb
+end
+function UI.contrastFg(c)
+  local r, g, b = math.floor(c / 65536) % 256, math.floor(c / 256) % 256, c % 256
+  return ((r * 299 + g * 587 + b * 114) / 1000 > 140) and 0x000000 or 0xffffff
+end
+-- возвращает число (цвет), false (сбросить на стандартный) или nil (отмена)
+function UI.pickColor(current)
+  local bw, bh = 70, 20
+  local bx, by = math.floor((W - bw) / 2) + 1, math.floor((H - bh) / 2) + 1
+  local cells = {}
+  for i, c in ipairs(UI.KIT_COLORS) do
+    local col, row = (i - 1) % 4, math.floor((i - 1) / 4)
+    cells[#cells + 1] = { x = bx + 2 + col * 16, y = by + 3 + row * 4, w = 15, h = 3, name = c[1], rgb = c[2] }
+  end
+  local reset = { x = bx + 2, y = by + 15, w = 31, h = 3 }
+  local function draw()
+    fill(bx, by, bw, bh, C.dlg)
+    frame(bx, by, bw, bh, C.accent, C.dlg)
+    text(bx + 2, by + 1, pad("Цвет названия комплекта:", bw - 6 - CROSS_W), C.gold, C.dlg)
+    drawCross(bx, by, bw)
+    for _, c in ipairs(cells) do
+      fill(c.x, c.y, c.w, c.h, c.rgb)
+      local label = (current == c.rgb and "✓ " or "") .. c.name
+      local l = unicode.len(label)
+      text(c.x + math.floor((c.w - l) / 2), c.y + 1, label, UI.contrastFg(c.rgb), c.rgb)
+    end
+    fill(reset.x, reset.y, reset.w, reset.h, C.panel2)
+    local rl = "Сбросить (стандартный)"
+    text(reset.x + math.floor((reset.w - unicode.len(rl)) / 2), reset.y + 1, rl, C.text, C.panel2)
+    text(bx + 2, by + 18, pad("Коснитесь цвета.  × - отмена", bw - 4), C.dim, C.dlg)
+  end
+  draw()
+  while true do
+    local e = table.pack(safePull(event.pullMultiple, "key_down", "touch", "player_off"))
+    if e[1] == "player_off" then pendingOff = true; return nil end
+    local who = (e[1] == "touch") and e[6] or e[5]
+    local mine = (not who or not S.player or lower(who) == lower(S.player.name))
+    if e[1] == "touch" then
+      if mine then
+        if hitCross(e, bx, by, bw) then return nil end
+        local x, y = e[3], e[4]
+        if type(x) == "number" and type(y) == "number" then
+          for _, c in ipairs(cells) do
+            if x >= c.x and x < c.x + c.w and y >= c.y + UI.oy and y < c.y + UI.oy + c.h then return c.rgb end
+          end
+          if x >= reset.x and x < reset.x + reset.w and y >= reset.y + UI.oy and y < reset.y + UI.oy + reset.h then
+            return false
+          end
+        end
+      end
+    elseif mine and e[4] == 1 then return nil end
+  end
 end
 local function modal(title, body)
   local bw = math.min(W - 4, 100)
@@ -2518,7 +2580,7 @@ local function screenKitView()
   if not kit then S.view = "list"; return false end
   local avail = availFn()
   local stock = kitStock(kit, avail)
-  text(2, 6, pad(kit.name, W - 34), C.accent, C.bg)
+  text(2, 6, pad(kit.name, W - 34), UI.kitColor(kit, C.accent), C.bg)
   text(2, 8, pad("Цена: " .. fmt(kit.price) .. " " .. CONFIG.CURRENCY .. "   В наличии: " .. stock .. " шт", W - 34),
        stock > 0 and C.text or C.red, C.bg)
   rb(6, 0, 30, "Купить за " .. fmt(kit.price),
@@ -2542,7 +2604,7 @@ local function screenPurchase(p)
     if k.name == pu.kit and #k.items > 0 then again = k; break end
   end
   local tw = again and (W - 68) or (W - 36)
-  text(2, 6, pad("Покупка #" .. pu.id .. ": " .. pu.kit, tw), C.accent, C.bg)
+  text(2, 6, pad("Покупка #" .. pu.id .. ": " .. pu.kit, tw), UI.kitColor(again, C.accent), C.bg)
   text(2, 8, pad("Забирайте по одному или кнопкой «Забрать всё».", tw), C.dim, C.bg)
   addBtn(W - 33, 6, 30, 3, "Забрать всё", { disabled = purchasePending(pu) == 0, bg = C.tabOn,
     fn = function() claimAll(pu) end })
@@ -2601,7 +2663,7 @@ local function screenKits()
     local y = LIST_Y + (i - first) * 4
     local stock = kitStock(k, avail)
     lineCard(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY .. "   Ресурсов: " .. #k.items ..
-                        "   В наличии: " .. stock .. " шт", stock > 0 and C.text or C.red)
+                        "   В наличии: " .. stock .. " шт", stock > 0 and C.text or C.red, nil, nil, UI.kitColor(k))
     rb(y, 0, BW, stock > 0 and "Перейти" or "Нет в наличии",
       { disabled = stock <= 0, bg = C.tabOn, fn = function() nav({ view = "kit", kitId = k.id }) end })
   end
@@ -2667,7 +2729,7 @@ end
 local function screenKitEdit()
   local kit = findKit(S.kitId)
   if not kit then S.view = "list"; return false end
-  local n, gap = 5, 1
+  local n, gap = 6, 1
   local bw = math.floor(((W - 2) - gap * (n - 1)) / n)
   local function bx(i) return 2 + (i - 1) * (bw + gap) end
   local lastW = (W - 1) - bx(n) + 1
@@ -2682,9 +2744,16 @@ local function screenKitEdit()
     if v then kit.price = round2(v); saveDB() end
     render()
   end })
-  addBtn(bx(3), 6, bw, 3, "+ Ресурс (ME)", { bg = C.tabOn, fn = function() openPicker("kit", "me") end })
-  addBtn(bx(4), 6, bw, 3, "+ Из инвентаря", { bg = C.blue, fn = function() openPicker("kit", "inv") end })
-  addBtn(bx(5), 6, lastW, 3, armed and "Точно удалить?" or "Удалить комплект",
+  local kc = UI.kitColor(kit)
+  addBtn(bx(3), 6, bw, 3, "Цвет названия", { bg = kc or C.panel2, fg = kc and UI.contrastFg(kc) or C.text, fn = function()
+    local c = UI.pickColor(kc)
+    if c == false then kit.color = nil; saveDB()
+    elseif c then kit.color = c; saveDB() end
+    render()
+  end })
+  addBtn(bx(4), 6, bw, 3, "+ Ресурс (ME)", { bg = C.tabOn, fn = function() openPicker("kit", "me") end })
+  addBtn(bx(5), 6, bw, 3, "+ Из инвентаря", { bg = C.blue, fn = function() openPicker("kit", "inv") end })
+  addBtn(bx(6), 6, lastW, 3, armed and "Точно удалить?" or "Удалить комплект",
     { bg = armed and C.red or C.panel2, fn = function()
       if S.confirm == "del" .. kit.id then
         local _, idx = findKit(kit.id)
@@ -2693,7 +2762,7 @@ local function screenKitEdit()
       else S.confirm = "del" .. kit.id; render() end
     end })
   text(2, 9, pad("Комплект: " .. kit.name .. "   Цена: " .. fmt(kit.price) .. " " .. CONFIG.CURRENCY ..
-       "   Склад: " .. kitStock(kit, availFn()) .. " шт", W - 2), C.accent, C.bg)
+       "   Склад: " .. kitStock(kit, availFn()) .. " шт", W - 2), UI.kitColor(kit, C.accent), C.bg)
   local y0 = LIST_Y + 1
   local first, last = paged(#kit.items, y0)
   if #kit.items == 0 then text(2, y0, "Пусто. Нажмите «+ Ресурс (ME)» или «+ Из инвентаря», чтобы добавить предмет.", C.dim, C.bg) end
@@ -3048,7 +3117,7 @@ local function screenCreate()
       local k = db.kits[i]
       local y = SUB_Y + (i - first) * 4
       lineCard(y, k.name, "Цена: " .. fmt(k.price) .. " " .. CONFIG.CURRENCY .. "   Ресурсов: " .. #k.items ..
-                          "   Склад: " .. kitStock(k, avail) .. " шт")
+                          "   Склад: " .. kitStock(k, avail) .. " шт", nil, nil, nil, UI.kitColor(k))
       rb(y, 0, BW, "Изменить", { bg = C.tabOn, fn = function() nav({ view = "edit", kitId = k.id }) end })
     end
   elseif S.csub == "topup" then
