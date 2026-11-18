@@ -26,6 +26,9 @@ local CONFIG = {
   JOURNAL_PATH      = "/home/kitshop/journal.log",
   JOURNAL_MAX       = 400 * 1024,
   OUTBOX_PATH       = "/home/kitshop/outbox.dat",
+  DEPOSIT_CONFIRM_TIME = 30,
+  DEPOSIT_SETTLE_TIME  = 10,
+  DEPOSIT_POLL         = 1,
   MODE        = "standalone",
   NET_PORT    = 4747,
   NET_KEY     = "change-me",
@@ -2125,22 +2128,95 @@ local function pushFromSlot(s, take, name, damage)
   end
   return 0
 end
+-- Всплывающее окно пополнения: показывает, сколько ждём, сколько ME уже подтвердила,
+-- и таймер проверки. Закрывается только по завершении (или касанием после результата).
+function UI.depositWindow(e, want)
+  local bw, bh = math.min(W - 4, 76), 14
+  local bx, by = math.floor((W - bw) / 2) + 1, math.floor((H - bh) / 2) + 1
+  local inner = bw - 4
+  local st = { expected = want, got = 0, stage = "Подготовка...", color = C.text,
+               elapsed = nil, limit = nil, final = false, ok = true,
+               foot = "Не сходите с плитки PIM, пока окно не закроется" }
+  local win = {}
+  local function draw()
+    local oy = UI.oy; UI.oy = 0
+    local edge = st.final and (st.ok and C.accent or C.red) or C.gold
+    fill(bx, by, bw, bh, C.dlg)
+    frame(bx, by, bw, bh, edge, C.dlg)
+    text(bx + 2, by + 1, pad("Пополнение: " .. e.label, inner - (CROSS_W + 1)), C.gold, C.dlg)
+    if st.final then drawCross(bx, by, bw) end
+    text(bx + 2, by + 3, pad("Ожидается: " .. st.expected .. " шт  x  " .. fmt(e.price) .. " = " ..
+         fmt(round2(st.expected * e.price)) .. " " .. CONFIG.CURRENCY, inner), C.text, C.dlg)
+    local lines = wrap(st.stage, inner)
+    for i = 1, 3 do text(bx + 2, by + 4 + i, pad(lines[i] or "", inner), st.color, C.dlg) end
+    fill(bx + 2, by + 9, inner, 1, 0x000000)
+    local frac = (st.expected > 0) and math.min(1, st.got / st.expected) or 0
+    fill(bx + 2, by + 9, math.floor(inner * frac + 0.5), 1, C.tabOn)
+    text(bx + 2, by + 10, pad("Подтверждено в ME: " .. st.got .. " из " .. st.expected .. " шт", inner),
+         C.accent, C.dlg)
+    local tline = ""
+    if st.limit and not st.final then
+      tline = "Проверка ME: " .. tostring(st.elapsed or 0) .. " / " .. st.limit .. " с"
+    end
+    text(bx + 2, by + 11, pad(tline, inner), C.dim, C.dlg)
+    text(bx + 2, by + 12, pad(st.foot, inner), C.dim, C.dlg)
+    UI.oy = oy
+  end
+  function win.set(stage, fields)
+    st.stage, st.color = stage, C.text
+    for k, v in pairs(fields or {}) do st[k] = v end
+    draw()
+  end
+  -- пауза с обработкой событий: уход с PIM только запоминаем, зачисление всё равно доводим до конца
+  function win.wait(sec)
+    local ev = table.pack(safePull(event.pullMultiple, sec, "player_off"))
+    if ev[1] == "player_off" then pendingOff = true end
+  end
+  function win.finish(msg, ok)
+    st.final, st.ok, st.stage = true, (ok ~= false), msg
+    st.color = st.ok and C.accent or C.red
+    st.foot = "Коснитесь экрана, чтобы закрыть"
+    draw()
+    local t0 = computer.uptime()
+    while true do
+      local left = 25 - (computer.uptime() - t0)
+      if left <= 0 then return end
+      local ev = table.pack(safePull(event.pullMultiple, left, "touch", "key_down", "player_off"))
+      if ev[1] == nil then return end
+      if ev[1] == "player_off" then pendingOff = true; return end
+      local who = (ev[1] == "touch") and ev[6] or ev[5]
+      if computer.uptime() - t0 > 1.5
+         and (not who or not S.player or lower(who) == lower(S.player.name)) then
+        return
+      end
+    end
+  end
+  draw()
+  return win
+end
 local function doDeposit(e, amount)
   status("Читаю инвентарь...")
   local before = readSlots()
   local have = countIn(before, e.name, e.damage, e.var)
+  -- ждём ровно столько, сколько указал игрок; для «Внести всё» - сколько лежит в инвентаре
   local want = amount and math.min(amount, have) or have
   if want <= 0 then return flash("В инвентаре нет «" .. e.label .. "».", false) end
   local pf, pfWhy = Net.preflight(status)
   if not pf then return flash(pfWhy, false) end
   pcall(Net.outboxRetry, S.player.name)
-  status("Записываю намерение пополнения...")
+  local win = UI.depositWindow(e, want)
+  local function fail(msg)
+    S.slots = readSlots()
+    win.finish(msg, false)
+    return flash(msg, false)
+  end
+  win.set("Записываю намерение пополнения...")
   local iid = Net.depositBegin({ player = S.player.name, name = e.name, damage = e.damage, var = e.var,
                                  label = e.label, price = e.price, want = want })
   if not iid then
-    return flash("Не удалось записать пополнение в журнал. Предметы не тронуты, повторите позже.", false)
+    return fail("Не удалось записать пополнение в журнал. Предметы не тронуты, повторите позже.")
   end
-  status("Принимаю ресурсы...")
+  win.set("Принимаю ресурсы из инвентаря...")
   lastPushErr = nil
   local fresh = readSlots()
   local unreadable = false
@@ -2149,15 +2225,13 @@ local function doDeposit(e, amount)
   local wantNow = math.min(want, haveNow)
   if unreadable or wantNow <= 0 then
     pcall(Net.depositEnd, iid, 0, S.player.name)
-    S.slots = readSlots()
-    return flash(unreadable and "Не удалось прочитать инвентарь (встаньте на PIM и повторите)."
-                 or "Предметы пропали из инвентаря до приёма. Пополнение отменено.", false)
+    return fail(unreadable and "Не удалось прочитать инвентарь (встаньте на PIM и повторите)."
+                or "Предметы пропали из инвентаря до приёма. Пополнение отменено.")
   end
   local meBefore = meCount(e.name, e.damage, e.var)
   if meBefore == nil then
     pcall(Net.depositEnd, iid, 0, S.player.name)
-    S.slots = readSlots()
-    return flash("ME-сеть недоступна. Предметы не тронуты, повторите позже.", false)
+    return fail("ME-сеть недоступна. Предметы не тронуты, повторите позже.")
   end
   local left, moved = wantNow, 0
   for s = 1, 36 do
@@ -2175,42 +2249,72 @@ local function doDeposit(e, amount)
     pcall(Net.depositEnd, iid, 0, S.player.name)
     local msg = "Не удалось принять предметы. Проверьте подключение ME Interface к PIM и свободное место в ME."
     if S.player.owner and lastPushErr then msg = msg .. " [" .. lastPushErr:sub(1, 80) .. "]" end
+    return fail(msg)
+  end
+  local sent = moved
+  local note = (moved < wantNow) and ("Передано только " .. moved .. " из " .. wantNow .. " шт. ") or ""
+  local limit  = CONFIG.DEPOSIT_CONFIRM_TIME or 30
+  local settle = CONFIG.DEPOSIT_SETTLE_TIME or 10
+  local poll   = CONFIG.DEPOSIT_POLL or 1
+  win.set(note .. "Предметы переданы. Жду подтверждения от ME...",
+          { expected = sent, got = 0, limit = limit, elapsed = 0 })
+  -- ждём, пока ME «увидит» все переданные предметы. Берём максимум прироста, чтобы чужая
+  -- выдача из ME в этот же момент не уменьшила зачисление.
+  local t0 = computer.uptime()
+  local lastGrow = t0
+  local best, seen = 0, false
+  while true do
+    local meAfter = meCount(e.name, e.damage, e.var)
+    if meAfter ~= nil then
+      seen = true
+      local got = math.max(0, math.min(sent, meAfter - meBefore))
+      if got > best then best = got; lastGrow = computer.uptime() end
+    end
+    local elapsed = computer.uptime() - t0
+    win.set(note .. (best > 0 and "ME принимает предметы..." or "Жду, пока ME примет предметы..."),
+            { got = best, elapsed = math.floor(elapsed) })
+    if best >= sent then break end
+    if elapsed >= limit then break end
+    if best > 0 and computer.uptime() - lastGrow >= settle then break end
+    win.wait(poll)
+  end
+  if not seen then
+    pcall(Net.fbAddEntry, "[сервер]", "Пополнение " .. S.player.name .. ": " .. e.label .. " x" .. sent ..
+          " - предметы переданы, но ME не ответила. Зачисление отложено. Проверьте вручную (Журнал -> Намерения).")
+    local msg = "Предметы (" .. sent .. " шт) переданы, но ME-сеть не ответила. Зачисление проверит владелец."
+    win.finish(msg, false)
     return flash(msg, false)
   end
-  status("Сверяю с ME...")
-  local meAfter, delta
-  for _ = 1, 12 do
-    meAfter = meCount(e.name, e.damage, e.var)
-    if meAfter ~= nil then
-      delta = meAfter - meBefore
-      if delta >= moved then break end
-    end
-    os.sleep(0.5)
+  if best <= 0 then
+    -- ничего не зачисляем, но и намерение НЕ закрываем: владелец увидит его в журнале и начислит вручную
+    pcall(Net.fbAddEntry, "[сервер]", "Пополнение " .. S.player.name .. ": " .. e.label .. " x" .. sent ..
+          " - предметы переданы, но ME не показала прироста за " .. limit ..
+          " с. Зачисление отложено. Проверьте вручную (Журнал -> Намерения).")
+    local msg = "Предметы (" .. sent .. " шт) переданы, но ME не подтвердила приём за " .. limit ..
+                " с. Зачисление отложено: владелец проверит и начислит вручную."
+    win.finish(msg, false)
+    return flash(msg, false)
   end
-  if delta == nil then
-    pcall(Net.fbAddEntry, "[сервер]", "Пополнение " .. S.player.name .. ": " .. e.label .. " x" .. moved ..
-          " - ME не подтвердила приём, зачисление отложено. Проверьте вручную (Журнал -> Намерения).")
-    return flash("Предметы приняты, но ME не подтвердила приём. Зачисление проверит владелец.", false)
-  end
-  if delta < moved then
-    local credited = math.max(0, delta)
+  local partial = best < sent
+  if partial then
     pcall(Net.fbAddEntry, "[сервер]", "Пополнение " .. S.player.name .. ": " .. e.label .. " - ME получила " ..
-          credited .. " из " .. moved .. " шт. Зачислено " .. credited .. ".")
-    moved = credited
-    if moved <= 0 then
-      pcall(Net.depositEnd, iid, 0, S.player.name)
-      return flash("ME не подтвердила приём предметов. Пополнение не зачислено.", false)
-    end
+          best .. " из " .. sent .. " шт. Зачислено " .. best .. ".")
   end
+  moved = best
   local c = cache.byKey[itemKey(e.name, e.damage, e.var)]
   if c then c.size = c.size + moved end
-  status("Зачисляю на баланс...")
+  win.set("Зачисляю на баланс...", { got = best })
   local okE, r = pcall(Net.depositEnd, iid, moved, S.player.name)
   if okE and r then
-    return flash("Принято " .. moved .. " шт. «" .. e.label .. "». Зачислено: " .. fmt(r.gain) .. " " .. CONFIG.CURRENCY, true)
+    local msg = "Принято " .. moved .. " шт. «" .. e.label .. "». Зачислено: " .. fmt(r.gain) .. " " .. CONFIG.CURRENCY
+    if partial then msg = msg .. ". ME подтвердила " .. moved .. " из " .. sent .. " шт, остаток проверит владелец." end
+    win.finish(msg, not partial)
+    return flash(msg, not partial)
   end
-  flash("Принято " .. moved .. " шт. «" .. e.label .. "» (" .. fmt(round2(moved * e.price)) .. " " .. CONFIG.CURRENCY ..
-        "), но зачисление задержалось. Оно сохранено и будет завершено автоматически при следующем входе.", false)
+  local msg = "Принято " .. moved .. " шт. «" .. e.label .. "» (" .. fmt(round2(moved * e.price)) .. " " .. CONFIG.CURRENCY ..
+              "), но зачисление задержалось. Оно сохранено и будет завершено автоматически при следующем входе."
+  win.finish(msg, false)
+  flash(msg, false)
 end
 local function doRefresh()
   if refreshRemaining() > 0 then return end
