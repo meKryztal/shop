@@ -15,7 +15,7 @@ local CONFIG = {
   CMD_PATH = "/home/kitshop/owner.cmd",
   ME_EXPORT_SIDE = "up",
   PIM_PUSH_SIDE  = "north",
-  REFRESH_COOLDOWN = 60,
+  REFRESH_COOLDOWN = 30,
   SCREEN_W = 160, SCREEN_H = 50,
   PICK_MAX = 300,
   MEM_LOW = 500 * 1024,
@@ -2175,11 +2175,13 @@ function UI.depositWindow(e, want)
   function win.finish(msg, ok)
     st.final, st.ok, st.stage = true, (ok ~= false), msg
     st.color = st.ok and C.accent or C.red
-    st.foot = "Коснитесь экрана, чтобы закрыть"
+    -- при успехе окно закрывается само через пару секунд; при ошибке/частичном зачислении остаётся до касания
+    local autoClose = st.ok and 2.5 or nil
+    st.foot = autoClose and "Окно закроется автоматически" or "Коснитесь экрана, чтобы закрыть"
     draw()
     local t0 = computer.uptime()
     while true do
-      local left = 25 - (computer.uptime() - t0)
+      local left = (autoClose or 25) - (computer.uptime() - t0)
       if left <= 0 then return end
       local ev = table.pack(safePull(event.pullMultiple, left, "touch", "key_down", "player_off"))
       if ev[1] == nil then return end
