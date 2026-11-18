@@ -2176,7 +2176,7 @@ function UI.depositWindow(e, want)
     st.final, st.ok, st.stage = true, (ok ~= false), msg
     st.color = st.ok and C.accent or C.red
     -- при успехе окно закрывается само через пару секунд; при ошибке/частичном зачислении остаётся до касания
-    local autoClose = st.ok and 1 or nil
+    local autoClose = st.ok and 2 or nil
     st.foot = autoClose and "Окно закроется автоматически" or "Коснитесь экрана, чтобы закрыть"
     draw()
     local t0 = computer.uptime()
